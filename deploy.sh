@@ -22,6 +22,7 @@
 # Docker-образы (open-webui, ollama) должны быть предварительно
 # загружены на сервер вручную или через docker save | ssh docker load.
 # Скрипт копирует docker-compose.yml, .env и запускает стек.
+# Сервис webhook-handler (профиль with-webhook) не запускается автоматически.
 # =============================================================================
 
 set -euo pipefail
@@ -46,6 +47,10 @@ SSH_KEY=""
 GIT_BRANCH="main"
 APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
+
+# Сервисы для запуска (webhook-handler исключён — требует профиль with-webhook
+# и сборку из ./mr-checker, которого нет на сервере)
+COMPOSE_SERVICES="open-webui ollama"
 
 # ── Разбор аргументов ─────────────────────────────────────────────────────────
 usage() {
@@ -131,6 +136,7 @@ set -euo pipefail
 APP_DIR="${APP_DIR}"
 DOCKER_COMPOSE="${DOCKER_COMPOSE}"
 APP_PORT="${APP_PORT}"
+COMPOSE_SERVICES="${COMPOSE_SERVICES}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
@@ -149,7 +155,6 @@ if [[ -f "\${APP_DIR}/.env" ]]; then
 fi
 tar -xzf "\${APP_DIR}/app.tar.gz" -C "\${APP_DIR}"
 rm -f "\${APP_DIR}/app.tar.gz"
-# Восстанавливаем .env если он был (не затираем секреты)
 if [[ -f "/tmp/.env.backup" ]]; then
   mv "/tmp/.env.backup" "\${APP_DIR}/.env"
   ok ".env восстановлен из резервной копии"
@@ -194,7 +199,7 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# 3. Перезапуск стека
+# 3. Перезапуск стека (только open-webui + ollama, без webhook-handler)
 if docker ps --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
   log "Остановка предыдущего стека..."
   eval "\${DOCKER_COMPOSE} down --remove-orphans"
@@ -203,8 +208,8 @@ else
   log "Запущенных контейнеров не найдено — первый запуск"
 fi
 
-log "Запуск стека (open-webui + ollama)..."
-eval "\${DOCKER_COMPOSE} up -d"
+log "Запуск стека (\${COMPOSE_SERVICES})..."
+eval "\${DOCKER_COMPOSE} up -d \${COMPOSE_SERVICES}"
 ok "Стек запущен"
 
 # 4. Ожидание готовности Open WebUI
