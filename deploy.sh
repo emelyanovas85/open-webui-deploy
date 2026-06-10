@@ -228,23 +228,43 @@ log "Запуск стека через \${COMPOSE_FILE}..."
 eval "\${DC_CMD} up -d --no-build"
 ok "Стек запущен"
 
-log "Ожидание готовности Open WebUI (max 120 сек)..."
-MAX_WAIT=120
+# ── Healthcheck: ждём готовности Open WebUI ───────────────────────────────────
+log "Ожидание готовности Open WebUI (max 300 сек)..."
+MAX_WAIT=300
 ELAPSED=0
 HEALTHY=false
+LAST_STATUS=""
 while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
+  # Проверяем что контейнер ещё жив
+  CONTAINER_STATUS=\$(docker inspect open-webui --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+  if [[ "\${CONTAINER_STATUS}" == "exited" || "\${CONTAINER_STATUS}" == "dead" || "\${CONTAINER_STATUS}" == "missing" ]]; then
+    echo ""
+    fail "Контейнер open-webui остановился со статусом '\${CONTAINER_STATUS}'. Логи:"
+  fi
   if curl -sf "http://localhost:\${APP_PORT}/" > /dev/null 2>&1; then
     HEALTHY=true
     break
   fi
-  printf "."
+  # Каждые 30 сек показываем статус контейнера
+  if (( ELAPSED % 30 == 0 && ELAPSED > 0 )); then
+    CONTAINER_STATUS=\$(docker inspect open-webui --format '{{.State.Status}} ({{.State.Health.Status}})' 2>/dev/null || echo "?")
+    echo -e "\n  ⏳ \${ELAPSED}с — контейнер: \${CONTAINER_STATUS}"
+  else
+    printf "."
+  fi
   sleep 3
   ELAPSED=\$((ELAPSED + 3))
 done
 echo ""
+
 if [[ "\$HEALTHY" != "true" ]]; then
-  warn "Open WebUI не ответил за \${MAX_WAIT} сек. Последние логи:"
-  eval "\${DC_CMD} logs --tail=50"
+  warn "Open WebUI не ответил за \${MAX_WAIT} сек."
+  echo ""
+  warn "Статус контейнера:"
+  docker inspect open-webui --format 'Status: {{.State.Status}}  ExitCode: {{.State.ExitCode}}' 2>/dev/null || true
+  echo ""
+  warn "Последние логи контейнера:"
+  docker logs open-webui --tail=60 2>&1 || true
   exit 1
 fi
 ok "Open WebUI готов (\${ELAPSED} сек)"
