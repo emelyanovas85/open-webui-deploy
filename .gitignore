@@ -1,0 +1,17 @@
+# Environment secrets
+.env
+
+# Docker volumes
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# MR_Checker source (если склонирован локально)
+mr-checker/
