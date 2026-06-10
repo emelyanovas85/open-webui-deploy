@@ -11,17 +11,18 @@
 #   -p, --port      SSH-порт (по умолчанию: 22)
 #   -i, --identity  Путь к приватному SSH-ключу (необязательно)
 #   -b, --branch    Ветка Git для деплоя (по умолчанию: main)
+#   --force-image   Принудительно передать образ, даже если он уже актуален
 #   --help          Показать справку
 #
 # Примеры:
 #   ./deploy.sh
 #   ./deploy.sh -h 192.168.1.100 -u deploy
 #   ./deploy.sh -i ~/.ssh/id_rsa -b feature/new-config
+#   ./deploy.sh --force-image
 #
 # Примечание: удалённый хост не имеет доступа в интернет.
-# Скрипт собирает/проверяет наличие образа open-webui локально, затем
-# передаёт его на сервер через docker save | ssh docker load, после чего
-# копирует конфигурацию и запускает стек через docker-compose.base.yml.
+# Скрипт сравнивает Image ID локально и на сервере — если совпадают,
+# передача пропускается. Иначе передаёт образ через docker save | ssh docker load.
 # =============================================================================
 
 set -euo pipefail
@@ -45,6 +46,7 @@ APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
 COMPOSE_FILE="docker-compose.base.yml"
 OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
+FORCE_IMAGE=false
 
 usage() {
   grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     -p|--port)      REMOTE_PORT="$2";     shift 2 ;;
     -i|--identity)  SSH_KEY="$2";         shift 2 ;;
     -b|--branch)    GIT_BRANCH="$2";      shift 2 ;;
+    --force-image)  FORCE_IMAGE=true;     shift   ;;
     --help)         usage ;;
     *) error "Неизвестный аргумент: $1. Используйте --help для справки." ;;
   esac
@@ -104,16 +107,35 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
+# ── Проверка и передача образа ────────────────────────────────────────────────
 log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
-  error "Локальный образ ${OPEN_WEBUI_IMAGE} не найден. Сначала загрузите его локально: docker pull ${OPEN_WEBUI_IMAGE}"
+  error "Локальный образ ${OPEN_WEBUI_IMAGE} не найден. Сначала загрузите его: docker pull ${OPEN_WEBUI_IMAGE}"
 fi
-ok "Локальный образ найден"
+LOCAL_IMAGE_ID=$(docker image inspect "${OPEN_WEBUI_IMAGE}" --format '{{.Id}}')
+ok "Локальный образ найден (ID: ${LOCAL_IMAGE_ID:7:12})"
 
-log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST} (docker save | ssh docker load)..."
-docker save "${OPEN_WEBUI_IMAGE}" | $SSH_CMD 'docker load'
-ok "Образ загружен на ${REMOTE_HOST}"
+NEED_TRANSFER=true
+if [[ "${FORCE_IMAGE}" == "false" ]]; then
+  log "Проверка образа на ${REMOTE_HOST}..."
+  REMOTE_IMAGE_ID=$($SSH_CMD "docker image inspect ${OPEN_WEBUI_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
+  if [[ "${REMOTE_IMAGE_ID}" == "${LOCAL_IMAGE_ID}" ]]; then
+    ok "Образ на сервере актуален (ID совпадает) — передача пропущена"
+    NEED_TRANSFER=false
+  elif [[ "${REMOTE_IMAGE_ID}" == "MISSING" ]]; then
+    log "Образ на сервере отсутствует — будет передан"
+  else
+    warn "Образ на сервере устарел (remote: ${REMOTE_IMAGE_ID:7:12}) — будет обновлён"
+  fi
+fi
 
+if [[ "${NEED_TRANSFER}" == "true" ]]; then
+  log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST} (docker save | ssh docker load)..."
+  docker save "${OPEN_WEBUI_IMAGE}" | $SSH_CMD 'docker load'
+  ok "Образ загружен на ${REMOTE_HOST}"
+fi
+
+# ── Конфигурация ──────────────────────────────────────────────────────────────
 log "Подготовка конфигурации (ветка: ${GIT_BRANCH})..."
 LOCAL_ARCHIVE="$(mktemp /tmp/open-webui-deploy-XXXXXX.tar.gz)"
 git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHIVE}" \
