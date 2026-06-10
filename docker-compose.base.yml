@@ -1,0 +1,63 @@
+# =============================================================================
+# docker-compose.base.yml — базовый стек: open-webui + ollama
+#
+# Используется скриптом deploy.sh для деплоя без webhook-handler.
+# webhook-handler (профиль with-webhook) требует сборки из ./mr-checker
+# и запускается отдельно при необходимости через:
+#   docker-compose -f docker-compose.yml --profile with-webhook up -d
+# =============================================================================
+version: '3.8'
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "8087:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      # LLM Provider settings
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
+
+      # Ollama (local LLM) settings
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+
+      # Authentication
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-changeme-super-secret-key}
+      - WEBUI_AUTH=${WEBUI_AUTH:-true}
+
+      # General settings
+      - WEBUI_NAME=${WEBUI_NAME:-Open WebUI}
+      - DEFAULT_MODELS=${DEFAULT_MODELS:-}
+      - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
+      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-true}
+
+      # Webhook integration (MR_Checker compatible)
+      - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
+      - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
+    depends_on:
+      - ollama
+    networks:
+      - webui-net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - webui-net
+
+volumes:
+  open-webui-data:
+  ollama-data:
+
+networks:
+  webui-net:
+    driver: bridge

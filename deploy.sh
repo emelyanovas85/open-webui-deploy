@@ -21,8 +21,8 @@
 # Примечание: удалённый хост не имеет доступа в интернет.
 # Docker-образы (open-webui, ollama) должны быть предварительно
 # загружены на сервер вручную или через docker save | ssh docker load.
-# Скрипт копирует docker-compose.yml, .env и запускает стек.
-# Сервис webhook-handler (профиль with-webhook) не запускается автоматически.
+# Скрипт копирует конфигурацию и запускает стек через docker-compose.base.yml
+# (без webhook-handler, который требует сборки из ./mr-checker).
 # =============================================================================
 
 set -euo pipefail
@@ -47,10 +47,9 @@ SSH_KEY=""
 GIT_BRANCH="main"
 APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
-
-# Сервисы для запуска (webhook-handler исключён — требует профиль with-webhook
-# и сборку из ./mr-checker, которого нет на сервере)
-COMPOSE_SERVICES="open-webui ollama"
+# Используем base-файл без webhook-handler (docker-compose v1 резолвит
+# build context для ВСЕХ сервисов в файле, даже если они не запускаются)
+COMPOSE_FILE="docker-compose.base.yml"
 
 # ── Разбор аргументов ─────────────────────────────────────────────────────────
 usage() {
@@ -136,7 +135,7 @@ set -euo pipefail
 APP_DIR="${APP_DIR}"
 DOCKER_COMPOSE="${DOCKER_COMPOSE}"
 APP_PORT="${APP_PORT}"
-COMPOSE_SERVICES="${COMPOSE_SERVICES}"
+COMPOSE_FILE="${COMPOSE_FILE}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
@@ -146,6 +145,8 @@ warn() { echo -e "\${YELLOW}  \u26a0\${NC} \$*"; }
 fail() { echo -e "\${RED}  \u2717\${NC} \$*" >&2; exit 1; }
 
 [[ "\${APP_DIR}" == \~* ]] && APP_DIR="\${HOME}/\${APP_DIR#\~/}"
+
+DC_CMD="\${DOCKER_COMPOSE} -f \${APP_DIR}/\${COMPOSE_FILE}"
 
 # 1. Распаковка архива (сохраняем .env если уже есть)
 log "Распаковка архива..."
@@ -164,8 +165,6 @@ elif [[ -f "\${APP_DIR}/.env.example" ]] && [[ ! -f "\${APP_DIR}/.env" ]]; then
 fi
 ok "Конфигурация распакована в \${APP_DIR}"
 
-cd "\${APP_DIR}"
-
 # 2. Проверка занятого порта не-docker процессом
 PORT_IN_USE=false
 if ss -tln "( sport = :\${APP_PORT} )" 2>/dev/null | grep -q LISTEN; then
@@ -174,7 +173,7 @@ fi
 
 if [[ "\${PORT_IN_USE}" == "true" ]]; then
   if docker ps --format '{{.Ports}}' | grep -q ":\${APP_PORT}->"; then
-    warn "Порт \${APP_PORT} уже занят Docker-контейнером — будет освобождён через docker compose down"
+    warn "Порт \${APP_PORT} уже занят Docker-контейнером — будет освобождён через down"
   else
     warn "Порт \${APP_PORT} уже занят процессом вне Docker"
     PIDS=\$(lsof -i :\${APP_PORT} -sTCP:LISTEN -t 2>/dev/null || true)
@@ -199,17 +198,17 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# 3. Перезапуск стека (только open-webui + ollama, без webhook-handler)
+# 3. Перезапуск стека
 if docker ps --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
   log "Остановка предыдущего стека..."
-  eval "\${DOCKER_COMPOSE} down --remove-orphans"
+  eval "\${DC_CMD} down --remove-orphans"
   ok "Стек остановлен"
 else
   log "Запущенных контейнеров не найдено — первый запуск"
 fi
 
-log "Запуск стека (\${COMPOSE_SERVICES})..."
-eval "\${DOCKER_COMPOSE} up -d \${COMPOSE_SERVICES}"
+log "Запуск стека через \${COMPOSE_FILE}..."
+eval "\${DC_CMD} up -d"
 ok "Стек запущен"
 
 # 4. Ожидание готовности Open WebUI
@@ -229,13 +228,13 @@ done
 echo ""
 if [[ "\$HEALTHY" != "true" ]]; then
   warn "Open WebUI не ответил за \${MAX_WAIT} сек. Последние логи:"
-  eval "\${DOCKER_COMPOSE} logs --tail=50"
+  eval "\${DC_CMD} logs --tail=50"
   exit 1
 fi
 ok "Open WebUI готов (\${ELAPSED} сек)"
 
 echo ""
-eval "\${DOCKER_COMPOSE} ps"
+eval "\${DC_CMD} ps"
 echo ""
 ok "Деплой завершён успешно"
 SERVER_IP=\$(hostname -I | awk '{print \$1}')
