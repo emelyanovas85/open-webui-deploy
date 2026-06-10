@@ -19,27 +19,23 @@
 #   ./deploy.sh -i ~/.ssh/id_rsa -b feature/new-config
 #
 # Примечание: удалённый хост не имеет доступа в интернет.
-# Docker-образы (open-webui, ollama) должны быть предварительно
-# загружены на сервер вручную или через docker save | ssh docker load.
-# Скрипт копирует конфигурацию и запускает стек через docker-compose.base.yml
-# (без webhook-handler, который требует сборки из ./mr-checker).
+# Скрипт собирает/проверяет наличие образа open-webui локально, затем
+# передаёт его на сервер через docker save | ssh docker load, после чего
+# копирует конфигурацию и запускает стек через docker-compose.base.yml.
 # =============================================================================
 
 set -euo pipefail
 
-# ── Цвета ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
 
 log()   { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
-ok()    { echo -e "${GREEN}[$(date '+%H:%M:%S')] \u2713${NC} $*"; }
-warn()  { echo -e "${YELLOW}[$(date '+%H:%M:%S')] \u26a0${NC} $*"; }
-error() { echo -e "${RED}[$(date '+%H:%M:%S')] \u2717${NC} $*" >&2; exit 1; }
+ok()    { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*"; }
+error() { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*" >&2; exit 1; }
 
-# ── Корень локального репозитория ─────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Значения по умолчанию ─────────────────────────────────────────────────────
 REMOTE_HOST="10.1.5.97"
 REMOTE_USER="svc-local-adm"
 REMOTE_PORT="22"
@@ -47,11 +43,9 @@ SSH_KEY=""
 GIT_BRANCH="main"
 APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
-# Используем base-файл без webhook-handler (docker-compose v1 резолвит
-# build context для ВСЕХ сервисов в файле, даже если они не запускаются)
 COMPOSE_FILE="docker-compose.base.yml"
+OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
 
-# ── Разбор аргументов ─────────────────────────────────────────────────────────
 usage() {
   grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
   exit 0
@@ -69,7 +63,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── SSH ControlMaster: одно подключение — один ввод пароля ────────────────────
 SSH_CTRL_DIR="$(mktemp -d /tmp/ssh-ctrl-XXXXXX)"
 SSH_CTRL_SOCK="${SSH_CTRL_DIR}/master"
 
@@ -85,12 +78,10 @@ SSH_BASE_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ControlMaster
 SSH_CMD="ssh ${SSH_BASE_OPTS} -p ${REMOTE_PORT} ${REMOTE_USER}@${REMOTE_HOST}"
 SCP_CMD="scp -r ${SSH_BASE_OPTS} -P ${REMOTE_PORT}"
 
-# ── Первое подключение (ввод пароля) ──────────────────────────────────────────
 log "Подключение к ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT} (единственный ввод пароля)..."
 $SSH_CMD "echo ok" > /dev/null 2>&1 || error "Не удалось подключиться к ${REMOTE_HOST}"
 ok "Соединение установлено (дальнейшие шаги — без пароля)"
 
-# ── Проверка зависимостей ─────────────────────────────────────────────────────
 log "Проверка зависимостей на удалённой машине..."
 $SSH_CMD bash << 'REMOTE_CHECK'
 set -e
@@ -113,7 +104,16 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Передача файлов конфигурации на сервер ────────────────────────────────────
+log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
+if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
+  error "Локальный образ ${OPEN_WEBUI_IMAGE} не найден. Сначала загрузите его локально: docker pull ${OPEN_WEBUI_IMAGE}"
+fi
+ok "Локальный образ найден"
+
+log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST} (docker save | ssh docker load)..."
+docker save "${OPEN_WEBUI_IMAGE}" | $SSH_CMD 'docker load'
+ok "Образ загружен на ${REMOTE_HOST}"
+
 log "Подготовка конфигурации (ветка: ${GIT_BRANCH})..."
 LOCAL_ARCHIVE="$(mktemp /tmp/open-webui-deploy-XXXXXX.tar.gz)"
 git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHIVE}" \
@@ -126,7 +126,6 @@ $SCP_CMD "${LOCAL_ARCHIVE}" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/app.tar.gz
 rm -f "${LOCAL_ARCHIVE}"
 ok "Архив передан"
 
-# ── Деплой на сервере ─────────────────────────────────────────────────────────
 log "Начало деплоя ветки '${GIT_BRANCH}' на ${REMOTE_HOST}:${APP_DIR}"
 
 $SSH_CMD bash -s <<REMOTE_DEPLOY
@@ -139,16 +138,14 @@ COMPOSE_FILE="${COMPOSE_FILE}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
-log()  { echo -e "\${BLUE}  \u2192\${NC} \$*"; }
-ok()   { echo -e "\${GREEN}  \u2713\${NC} \$*"; }
-warn() { echo -e "\${YELLOW}  \u26a0\${NC} \$*"; }
-fail() { echo -e "\${RED}  \u2717\${NC} \$*" >&2; exit 1; }
+log()  { echo -e "\${BLUE}  →\${NC} \$*"; }
+ok()   { echo -e "\${GREEN}  ✓\${NC} \$*"; }
+warn() { echo -e "\${YELLOW}  ⚠\${NC} \$*"; }
+fail() { echo -e "\${RED}  ✗\${NC} \$*" >&2; exit 1; }
 
 [[ "\${APP_DIR}" == \~* ]] && APP_DIR="\${HOME}/\${APP_DIR#\~/}"
-
 DC_CMD="\${DOCKER_COMPOSE} -f \${APP_DIR}/\${COMPOSE_FILE}"
 
-# 1. Распаковка архива (сохраняем .env если уже есть)
 log "Распаковка архива..."
 if [[ -f "\${APP_DIR}/.env" ]]; then
   cp "\${APP_DIR}/.env" "/tmp/.env.backup"
@@ -165,7 +162,6 @@ elif [[ -f "\${APP_DIR}/.env.example" ]] && [[ ! -f "\${APP_DIR}/.env" ]]; then
 fi
 ok "Конфигурация распакована в \${APP_DIR}"
 
-# 2. Проверка занятого порта не-docker процессом
 PORT_IN_USE=false
 if ss -tln "( sport = :\${APP_PORT} )" 2>/dev/null | grep -q LISTEN; then
   PORT_IN_USE=true
@@ -198,20 +194,18 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# 3. Перезапуск стека
-if docker ps --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+if docker ps -a --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
   log "Остановка предыдущего стека..."
-  eval "\${DC_CMD} down --remove-orphans"
+  eval "\${DC_CMD} down --remove-orphans" || true
   ok "Стек остановлен"
 else
   log "Запущенных контейнеров не найдено — первый запуск"
 fi
 
 log "Запуск стека через \${COMPOSE_FILE}..."
-eval "\${DC_CMD} up -d"
+eval "\${DC_CMD} up -d --no-build"
 ok "Стек запущен"
 
-# 4. Ожидание готовности Open WebUI
 log "Ожидание готовности Open WebUI (max 120 сек)..."
 MAX_WAIT=120
 ELAPSED=0
@@ -238,9 +232,7 @@ eval "\${DC_CMD} ps"
 echo ""
 ok "Деплой завершён успешно"
 SERVER_IP=\$(hostname -I | awk '{print \$1}')
-echo -e "\${GREEN}  Open WebUI:   http://\${SERVER_IP}:\${APP_PORT}/\${NC}"
-echo -e "\${GREEN}  Ollama API:   http://\${SERVER_IP}:11434/\${NC}"
-
+echo -e "\${GREEN}  Open WebUI: http://\${SERVER_IP}:\${APP_PORT}/\${NC}"
 REMOTE_DEPLOY
 
 ok "Деплой на ${REMOTE_HOST} завершён"
