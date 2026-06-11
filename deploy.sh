@@ -309,7 +309,7 @@ ok "Open WebUI готов за \${ELAPSED} сек"
 
 # ── Ждём завершения init-контейнера ───────────────────────────────────────────
 log "Ожидание завершения init-контейнера (admin + pipe function + MCP)..."
-INIT_MAX_WAIT=120
+INIT_MAX_WAIT=300
 INIT_ELAPSED=0
 INIT_START=\$(date +%s)
 
