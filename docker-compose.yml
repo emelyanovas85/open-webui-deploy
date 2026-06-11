@@ -2,36 +2,71 @@ version: '3.8'
 
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.8.10
     container_name: open-webui
     restart: unless-stopped
     ports:
       - "8087:8080"
     volumes:
       - open-webui-data:/app/backend/data
+      - ./scripts:/app/scripts:ro
     environment:
-      # LLM Provider settings
+      # ── LLM Provider (OpenAI-compatible API) ──────────────────────────────
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
 
-      # Ollama (local LLM) settings
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      # ── Ollama (отключён, используем внешний LLM) ─────────────────────────
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
 
-      # Authentication
+      # ── Security ──────────────────────────────────────────────────────────
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-changeme-super-secret-key}
       - WEBUI_AUTH=${WEBUI_AUTH:-true}
 
-      # General settings
+      # ── Автосоздание администратора при первом запуске ────────────────────
+      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
+      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
+      - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME:-Admin}
+
+      # ── Общие настройки ───────────────────────────────────────────────────
       - WEBUI_NAME=${WEBUI_NAME:-Open WebUI}
       - DEFAULT_MODELS=${DEFAULT_MODELS:-}
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
-      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-true}
+      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # Webhook integration (MR_Checker compatible)
+      # ── Прокси: исключаем локальные сервисы ───────────────────────────────
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.1.5.97}
+      - no_proxy=${no_proxy:-localhost,127.0.0.1,10.1.5.97}
+
+      # ── MCP Tool Server ───────────────────────────────────────────────────
+      - MCP_SERVER_URL=${MCP_SERVER_URL:-}
+
+      # ── Webhook integration ───────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
+    networks:
+      - webui-net
+
+  # ── Init-контейнер: создаёт admin + pipe function + MCP tool server ───────
+  open-webui-init:
+    image: python:3.11-slim
+    container_name: open-webui-init
+    restart: "no"
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
+      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
+      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
+      - MCP_SERVER_URL=${MCP_SERVER_URL:-}
     depends_on:
-      - ollama
+      - open-webui
+    command: >
+      bash -c "
+        pip install requests --quiet &&
+        echo 'Waiting for Open WebUI to start...' &&
+        sleep 15 &&
+        python /scripts/init-openwebui.py
+      "
     networks:
       - webui-net
 
@@ -45,8 +80,10 @@ services:
       - ollama-data:/root/.ollama
     networks:
       - webui-net
+    profiles:
+      - with-ollama
 
-  # Webhook Handler (MR_Checker service)
+  # ── Webhook Handler (MR_Checker) ──────────────────────────────────────────
   webhook-handler:
     build:
       context: ./mr-checker
