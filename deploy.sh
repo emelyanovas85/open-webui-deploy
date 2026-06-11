@@ -44,8 +44,9 @@ SSH_KEY=""
 GIT_BRANCH="main"
 APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
-COMPOSE_FILE="docker-compose.base.yml"
-OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
+COMPOSE_FILE="docker-compose.yml"
+OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.8.10"
+PYTHON_INIT_IMAGE="python:3.11-slim"
 FORCE_IMAGE=false
 
 usage() {
@@ -107,7 +108,7 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Проверка и передача образа ────────────────────────────────────────────────
+# ── Проверка и передача open-webui образа ─────────────────────────────────────
 log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   error "Локальный образ ${OPEN_WEBUI_IMAGE} не найден. Сначала загрузите его: docker pull ${OPEN_WEBUI_IMAGE}"
@@ -132,7 +133,34 @@ fi
 if [[ "${NEED_TRANSFER}" == "true" ]]; then
   log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST} (docker save | ssh docker load)..."
   docker save "${OPEN_WEBUI_IMAGE}" | $SSH_CMD 'docker load'
-  ok "Образ загружен на ${REMOTE_HOST}"
+  ok "Образ open-webui загружен на ${REMOTE_HOST}"
+fi
+
+# ── Проверка и передача python:3.11-slim для init-контейнера ──────────────────
+log "Проверка образа init-контейнера ${PYTHON_INIT_IMAGE} локально..."
+if ! docker image inspect "${PYTHON_INIT_IMAGE}" >/dev/null 2>&1; then
+  warn "Локальный образ ${PYTHON_INIT_IMAGE} не найден — пробуем docker pull..."
+  docker pull "${PYTHON_INIT_IMAGE}" || error "Не удалось получить ${PYTHON_INIT_IMAGE}"
+fi
+LOCAL_PYTHON_ID=$(docker image inspect "${PYTHON_INIT_IMAGE}" --format '{{.Id}}')
+ok "Образ init-контейнера найден (ID: ${LOCAL_PYTHON_ID:7:12})"
+
+NEED_PYTHON_TRANSFER=true
+if [[ "${FORCE_IMAGE}" == "false" ]]; then
+  log "Проверка ${PYTHON_INIT_IMAGE} на ${REMOTE_HOST}..."
+  REMOTE_PYTHON_ID=$($SSH_CMD "docker image inspect ${PYTHON_INIT_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
+  if [[ "${REMOTE_PYTHON_ID}" == "${LOCAL_PYTHON_ID}" ]]; then
+    ok "Образ python:3.11-slim на сервере актуален — передача пропущена"
+    NEED_PYTHON_TRANSFER=false
+  else
+    log "Образ python:3.11-slim на сервере отсутствует или устарел — будет передан"
+  fi
+fi
+
+if [[ "${NEED_PYTHON_TRANSFER}" == "true" ]]; then
+  log "Передача образа ${PYTHON_INIT_IMAGE} на ${REMOTE_HOST}..."
+  docker save "${PYTHON_INIT_IMAGE}" | $SSH_CMD 'docker load'
+  ok "Образ python:3.11-slim загружен на ${REMOTE_HOST}"
 fi
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
@@ -184,6 +212,9 @@ elif [[ -f "\${APP_DIR}/.env.example" ]] && [[ ! -f "\${APP_DIR}/.env" ]]; then
 fi
 ok "Конфигурация распакована в \${APP_DIR}"
 
+# Убедимся что scripts/ исполняемые
+chmod +x "\${APP_DIR}/scripts/"*.py 2>/dev/null || true
+
 PORT_IN_USE=false
 if ss -tln "( sport = :\${APP_PORT} )" 2>/dev/null | grep -q LISTEN; then
   PORT_IN_USE=true
@@ -229,7 +260,6 @@ eval "\${DC_CMD} up -d --no-build"
 ok "Стек запущен"
 
 # ── Healthcheck: ждём готовности Open WebUI по /health ────────────────────────
-# /health возвращает {"status": true} только когда приложение полностью готово
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
 ELAPSED=0
@@ -237,7 +267,6 @@ HEALTHY=false
 START_TS=\$(date +%s)
 
 while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
-  # Проверяем что контейнер ещё жив
   CONTAINER_STATUS=\$(docker inspect open-webui --format '{{.State.Status}}' 2>/dev/null || echo "missing")
   if [[ "\${CONTAINER_STATUS}" == "exited" || "\${CONTAINER_STATUS}" == "dead" || "\${CONTAINER_STATUS}" == "missing" ]]; then
     echo ""
@@ -247,7 +276,6 @@ while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
     fail "Деплой прерван — контейнер упал"
   fi
 
-  # Проверяем /health — официальный readiness-эндпоинт Open WebUI
   HEALTH_RESPONSE=\$(curl -sf --max-time 3 "http://localhost:\${APP_PORT}/health" 2>/dev/null || echo "")
   if echo "\${HEALTH_RESPONSE}" | grep -q '"status":.*true'; then
     HEALTHY=true
@@ -255,7 +283,6 @@ while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
     break
   fi
 
-  # Каждые 30 сек показываем статус контейнера
   if (( ELAPSED % 30 == 0 && ELAPSED > 0 )); then
     CONTAINER_DETAIL=\$(docker inspect open-webui --format '{{.State.Status}} ({{.State.Health.Status}})' 2>/dev/null || echo "?")
     echo -e "\n  ⏳ \${ELAPSED}с — контейнер: \${CONTAINER_DETAIL}, /health: \${HEALTH_RESPONSE:-нет ответа}"
@@ -279,12 +306,44 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 
 ok "Open WebUI готов за \${ELAPSED} сек"
+
+# ── Ждём завершения init-контейнера ───────────────────────────────────────────
+log "Ожидание завершения init-контейнера (admin + pipe function + MCP)..."
+INIT_MAX_WAIT=120
+INIT_ELAPSED=0
+INIT_START=\$(date +%s)
+
+while [[ \$INIT_ELAPSED -lt \$INIT_MAX_WAIT ]]; do
+  INIT_STATUS=\$(docker inspect open-webui-init --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+  if [[ "\${INIT_STATUS}" == "exited" ]]; then
+    INIT_EXIT_CODE=\$(docker inspect open-webui-init --format '{{.State.ExitCode}}' 2>/dev/null || echo "1")
+    if [[ "\${INIT_EXIT_CODE}" == "0" ]]; then
+      ok "Init-контейнер завершился успешно"
+    else
+      warn "Init-контейнер завершился с кодом \${INIT_EXIT_CODE}"
+    fi
+    break
+  fi
+  if [[ "\${INIT_STATUS}" == "missing" ]]; then
+    warn "Init-контейнер не найден — пропускаем ожидание"
+    break
+  fi
+  printf "."
+  sleep 3
+  INIT_ELAPSED=\$(( \$(date +%s) - INIT_START ))
+done
+echo ""
+
+log "Логи init-контейнера:"
+docker logs open-webui-init 2>&1 || true
+
 echo ""
 eval "\${DC_CMD} ps"
 echo ""
 ok "Деплой завершён успешно"
 SERVER_IP=\$(hostname -I | awk '{print \$1}')
 echo -e "\${GREEN}  Open WebUI: http://\${SERVER_IP}:\${APP_PORT}/\${NC}"
+echo -e "\${GREEN}  Логин: bugbusters@cbr.ru\${NC}"
 REMOTE_DEPLOY
 
 ok "Деплой на ${REMOTE_HOST} завершён"
