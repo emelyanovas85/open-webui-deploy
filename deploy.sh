@@ -12,6 +12,7 @@
 #   -i, --identity  Путь к приватному SSH-ключу (необязательно)
 #   -b, --branch    Ветка Git для деплоя (по умолчанию: main)
 #   --force-image   Принудительно передать образ, даже если он уже актуален
+#   --proxy         HTTP/HTTPS прокси для docker pull (напр.: http://proxy:3128)
 #   --help          Показать справку
 #
 # Примеры:
@@ -19,6 +20,7 @@
 #   ./deploy.sh -h 192.168.1.100 -u deploy
 #   ./deploy.sh -i ~/.ssh/id_rsa -b feature/new-config
 #   ./deploy.sh --force-image
+#   ./deploy.sh --proxy http://proxy.example.com:3128
 #
 # Примечание: удалённый хост не имеет доступа в интернет.
 # Скрипт сравнивает Image ID локально и на сервере — если совпадают,
@@ -48,6 +50,7 @@ COMPOSE_FILE="docker-compose.yml"
 OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.8.10"
 PYTHON_INIT_IMAGE="python:3.11-slim"
 FORCE_IMAGE=false
+HTTPS_PROXY_URL=""
 
 usage() {
   grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
@@ -56,16 +59,32 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--host)      REMOTE_HOST="$2";     shift 2 ;;
-    -u|--user)      REMOTE_USER="$2";     shift 2 ;;
-    -p|--port)      REMOTE_PORT="$2";     shift 2 ;;
-    -i|--identity)  SSH_KEY="$2";         shift 2 ;;
-    -b|--branch)    GIT_BRANCH="$2";      shift 2 ;;
-    --force-image)  FORCE_IMAGE=true;     shift   ;;
+    -h|--host)      REMOTE_HOST="$2";       shift 2 ;;
+    -u|--user)      REMOTE_USER="$2";       shift 2 ;;
+    -p|--port)      REMOTE_PORT="$2";       shift 2 ;;
+    -i|--identity)  SSH_KEY="$2";           shift 2 ;;
+    -b|--branch)    GIT_BRANCH="$2";        shift 2 ;;
+    --force-image)  FORCE_IMAGE=true;       shift   ;;
+    --proxy)        HTTPS_PROXY_URL="$2";   shift 2 ;;
     --help)         usage ;;
     *) error "Неизвестный аргумент: $1. Используйте --help для справки." ;;
   esac
 done
+
+# Если прокси не задан аргументом, берём из окружения
+[[ -z "${HTTPS_PROXY_URL}" && -n "${HTTPS_PROXY:-}" ]] && HTTPS_PROXY_URL="${HTTPS_PROXY}"
+[[ -z "${HTTPS_PROXY_URL}" && -n "${https_proxy:-}" ]] && HTTPS_PROXY_URL="${https_proxy}"
+
+# Функция для docker pull с поддержкой прокси
+docker_pull() {
+  local image="$1"
+  if [[ -n "${HTTPS_PROXY_URL}" ]]; then
+    log "Используем прокси: ${HTTPS_PROXY_URL}"
+    HTTPS_PROXY="${HTTPS_PROXY_URL}" HTTP_PROXY="${HTTPS_PROXY_URL}" docker pull "${image}"
+  else
+    docker pull "${image}"
+  fi
+}
 
 SSH_CTRL_DIR="$(mktemp -d /tmp/ssh-ctrl-XXXXXX)"
 SSH_CTRL_SOCK="${SSH_CTRL_DIR}/master"
@@ -111,10 +130,11 @@ log "Используем: ${DOCKER_COMPOSE}"
 # ── Проверка и передача open-webui образа ─────────────────────────────────────
 log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
-  error "Локальный образ ${OPEN_WEBUI_IMAGE} не найден. Сначала загрузите его: docker pull ${OPEN_WEBUI_IMAGE}"
+  warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
+  docker_pull "${OPEN_WEBUI_IMAGE}" || error "Не удалось загрузить ${OPEN_WEBUI_IMAGE}. Проверьте доступ в интернет или укажите прокси: ./deploy.sh --proxy http://proxy:3128"
 fi
 LOCAL_IMAGE_ID=$(docker image inspect "${OPEN_WEBUI_IMAGE}" --format '{{.Id}}')
-ok "Локальный образ найден (ID: ${LOCAL_IMAGE_ID:7:12})"
+ok "Образ найден (ID: ${LOCAL_IMAGE_ID:7:12})"
 
 NEED_TRANSFER=true
 if [[ "${FORCE_IMAGE}" == "false" ]]; then
@@ -139,8 +159,8 @@ fi
 # ── Проверка и передача python:3.11-slim для init-контейнера ──────────────────
 log "Проверка образа init-контейнера ${PYTHON_INIT_IMAGE} локально..."
 if ! docker image inspect "${PYTHON_INIT_IMAGE}" >/dev/null 2>&1; then
-  warn "Локальный образ ${PYTHON_INIT_IMAGE} не найден — пробуем docker pull..."
-  docker pull "${PYTHON_INIT_IMAGE}" || error "Не удалось получить ${PYTHON_INIT_IMAGE}"
+  warn "Локальный образ ${PYTHON_INIT_IMAGE} не найден — запускаем docker pull..."
+  docker_pull "${PYTHON_INIT_IMAGE}" || error "Не удалось загрузить ${PYTHON_INIT_IMAGE}. Укажите прокси: ./deploy.sh --proxy http://proxy:3128"
 fi
 LOCAL_PYTHON_ID=$(docker image inspect "${PYTHON_INIT_IMAGE}" --format '{{.Id}}')
 ok "Образ init-контейнера найден (ID: ${LOCAL_PYTHON_ID:7:12})"
@@ -206,9 +226,6 @@ rm -f "\${APP_DIR}/app.tar.gz"
 if [[ -f "/tmp/.env.backup" ]]; then
   mv "/tmp/.env.backup" "\${APP_DIR}/.env"
   ok ".env восстановлен из резервной копии"
-elif [[ -f "\${APP_DIR}/.env.example" ]] && [[ ! -f "\${APP_DIR}/.env" ]]; then
-  cp "\${APP_DIR}/.env.example" "\${APP_DIR}/.env"
-  warn ".env создан из .env.example — заполните значения в \${APP_DIR}/.env"
 fi
 ok "Конфигурация распакована в \${APP_DIR}"
 
