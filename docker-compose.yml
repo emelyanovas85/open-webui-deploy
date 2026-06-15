@@ -11,7 +11,7 @@ services:
       - open-webui-data:/app/backend/data
       - ./scripts:/app/scripts:ro
     environment:
-      # ── LLM Provider (OpenAI-compatible API) ──────────────────────────────
+      # ── LLM Provider (OpenAI-compatible API) ───────────────────────────────────
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
 
@@ -32,6 +32,11 @@ services:
       - DEFAULT_MODELS=${DEFAULT_MODELS:-}
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
+
+      # ── RAG / Embeddings (отключаем загрузку с HuggingFace — сервер без интернета) ───
+      - RAG_EMBEDDING_ENGINE=${RAG_EMBEDDING_ENGINE:-openai}
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-text-embedding-3-small}
+      - ENABLE_RAG_WEB_SEARCH=${ENABLE_RAG_WEB_SEARCH:-false}
 
       # ── Прокси: явно сбрасываем системный прокси ─────────────────────────
       - HTTP_PROXY=
