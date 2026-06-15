@@ -199,7 +199,12 @@ def get_token():
 
 
 def upsert_pipe_function(token):
-    """Создаём или обновляем Pipe Function."""
+    """Создаём или обновляем Pipe Function.
+
+    Open WebUI v0.8+:
+      - создание:   POST /api/v1/functions/create
+      - обновление: PUT  /api/v1/functions/{id}   ← не POST /{id}/update
+    """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     r = requests.get(f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
@@ -211,8 +216,9 @@ def upsert_pipe_function(token):
     }
 
     if r.status_code == 200:
-        r = requests.post(
-            f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}/update",
+        # PUT /api/v1/functions/{id} — правильный эндпоинт обновления в v0.8+
+        r = requests.put(
+            f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}",
             headers=headers, json=payload, timeout=10,
         )
         print(f"[OK] Pipe function updated: {r.status_code}")
@@ -243,8 +249,17 @@ def add_mcp_tool_servers(token):
     existing = {}
     r = requests.get(f"{BASE_URL}/api/v1/tools/servers", headers=headers, timeout=10)
     if r.status_code == 200:
-        for srv in r.json():
-            existing[srv.get("url", "")] = srv
+        try:
+            data = r.json()
+            if isinstance(data, list):
+                for srv in data:
+                    existing[srv.get("url", "")] = srv
+            else:
+                print(f"[WARN] Unexpected format from /tools/servers: {type(data)}")
+        except Exception as e:
+            print(f"[WARN] Could not parse /tools/servers: {e} — body: {r.text[:200]}")
+    else:
+        print(f"[WARN] GET /tools/servers returned {r.status_code}: {r.text[:200]}")
 
     for srv in servers:
         url = srv["url"]
