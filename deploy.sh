@@ -252,7 +252,7 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# Останавливаем предыдущий стек (только open-webui, init запускаем отдельно)
+# Останавливаем предыдущий стек
 if docker ps -a --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
   log "Остановка предыдущего стека..."
   eval "\${DC_CMD} down --remove-orphans" || true
@@ -262,7 +262,7 @@ else
   log "Запущенных контейнеров не найдено — первый запуск"
 fi
 
-# Запускаем ТОЛЬКО open-webui (init запустим вручную после healthcheck)
+# Запускаем ТОЛЬКО open-webui
 log "Запуск open-webui..."
 eval "\${DC_CMD} up -d --no-build open-webui"
 ok "open-webui запущен"
@@ -308,20 +308,22 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Ждём доступности MCP-серверов ─────────────────────────────────────────────
-MCP_SERVERS=("http://localhost:8086/sse" "http://localhost:8083/sse")
+# ── Проверка доступности MCP-серверов через TCP (не curl — SSE не закрывает соединение) ──
+# Формат: "host port"
+MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
-log "Ожидание доступности MCP-серверов (max \${MCP_MAX_WAIT} сек)..."
+log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
 
-for MCP_URL in "\${MCP_SERVERS[@]}"; do
+for MCP_ENTRY in "\${MCP_SERVERS[@]}"; do
+  MCP_HOST=\$(echo "\${MCP_ENTRY}" | cut -d' ' -f1)
+  MCP_PORT=\$(echo "\${MCP_ENTRY}" | cut -d' ' -f2)
   MCP_START=\$(date +%s)
   MCP_READY=false
-  printf "  Проверка \${MCP_URL} "
+  printf "  Проверка \${MCP_HOST}:\${MCP_PORT} "
   while true; do
     MCP_ELAPSED=\$(( \$(date +%s) - MCP_START ))
     [[ \$MCP_ELAPSED -ge \$MCP_MAX_WAIT ]] && break
-    HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 --no-proxy "\${MCP_URL}" 2>/dev/null || echo "000")
-    if [[ "\${HTTP_CODE}" == "200" ]]; then
+    if nc -z -w2 "\${MCP_HOST}" "\${MCP_PORT}" 2>/dev/null; then
       MCP_READY=true
       break
     fi
@@ -330,17 +332,17 @@ for MCP_URL in "\${MCP_SERVERS[@]}"; do
   done
   echo ""
   if [[ "\${MCP_READY}" == "true" ]]; then
-    ok "MCP-сервер доступен: \${MCP_URL}"
+    ok "MCP-сервер доступен: \${MCP_HOST}:\${MCP_PORT}"
   else
-    warn "MCP-сервер не ответил за \${MCP_MAX_WAIT} сек: \${MCP_URL} — продолжаем без него"
+    warn "MCP-сервер недоступен: \${MCP_HOST}:\${MCP_PORT} — продолжаем без него"
   fi
 done
 
-# Дополнительная пауза чтобы Open WebUI успел переподключиться к MCP
+# Пауза чтобы Open WebUI успел переподключиться к MCP
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера вручную (docker-compose v1 не поддерживает depends_on condition) ──
+# ── Запуск init-контейнера ────────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
 docker rm -f open-webui-init 2>/dev/null || true
 if eval "\${DC_CMD} run --rm --name open-webui-init open-webui-init"; then
