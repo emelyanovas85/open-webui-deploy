@@ -25,6 +25,7 @@
 # Примечание: удалённый хост не имеет доступа в интернет.
 # Скрипт сравнивает Image ID локально и на сервере — если совпадают,
 # передача пропускается. Иначе передаёт образ через docker save | ssh docker load.
+# .env всегда берётся из git (редактируйте его локально и деплойте).
 # =============================================================================
 
 set -euo pipefail
@@ -71,11 +72,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Если прокси не задан аргументом, берём из окружения
 [[ -z "${HTTPS_PROXY_URL}" && -n "${HTTPS_PROXY:-}" ]] && HTTPS_PROXY_URL="${HTTPS_PROXY}"
 [[ -z "${HTTPS_PROXY_URL}" && -n "${https_proxy:-}" ]] && HTTPS_PROXY_URL="${https_proxy}"
 
-# Функция для docker pull с поддержкой прокси
 docker_pull() {
   local image="$1"
   if [[ -n "${HTTPS_PROXY_URL}" ]]; then
@@ -215,17 +214,9 @@ fail() { echo -e "\${RED}  ✗\${NC} \$*" >&2; exit 1; }
 DC_CMD="\${DOCKER_COMPOSE} -f \${APP_DIR}/\${COMPOSE_FILE}"
 
 log "Распаковка архива..."
-if [[ -f "\${APP_DIR}/.env" ]]; then
-  cp "\${APP_DIR}/.env" "/tmp/.env.backup"
-  warn "Найден существующий .env — сохранён в /tmp/.env.backup"
-fi
 tar -xzf "\${APP_DIR}/app.tar.gz" -C "\${APP_DIR}"
 rm -f "\${APP_DIR}/app.tar.gz"
-if [[ -f "/tmp/.env.backup" ]]; then
-  mv "/tmp/.env.backup" "\${APP_DIR}/.env"
-  ok ".env восстановлен из резервной копии"
-fi
-ok "Конфигурация распакована в \${APP_DIR}"
+ok "Конфигурация распакована в \${APP_DIR} (.env взят из git)"
 
 # Убедимся что scripts/ исполняемые
 chmod +x "\${APP_DIR}/scripts/"*.py 2>/dev/null || true
@@ -291,7 +282,7 @@ while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
     fail "Деплой прерван — контейнер упал"
   fi
 
-  HEALTH_RESPONSE=\$(curl -sf --max-time 3 "http://localhost:\${APP_PORT}/health" 2>/dev/null || echo "")
+  HEALTH_RESPONSE=\$(curl -sf --noproxy '*' --max-time 3 "http://localhost:\${APP_PORT}/health" 2>/dev/null || echo "")
   if echo "\${HEALTH_RESPONSE}" | grep -q '"status":.*true'; then
     HEALTHY=true
     ELAPSED=\$(( \$(date +%s) - START_TS ))
