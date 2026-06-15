@@ -33,7 +33,7 @@ services:
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # ── Прокси: явно сбрасываем системный прокси ─────────────────────────────
+      # ── Прокси: явно сбрасываем системный прокси ─────────────────────────
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - http_proxy=
@@ -45,11 +45,11 @@ services:
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health | grep -q '\"status\":true' || exit 1"]
+      interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
     networks:
       - webui-net
 
@@ -60,9 +60,6 @@ services:
       dockerfile: Dockerfile
     image: open-webui-init:latest
     container_name: open-webui-init
-    # restart: "no" убран — контейнер пересоздаётся при каждом `docker compose up`
-    # Используйте `docker compose up --force-recreate open-webui-init` или
-    # `docker compose run --rm open-webui-init` для ручного запуска
     restart: "no"
     environment:
       - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
@@ -74,7 +71,6 @@ services:
     depends_on:
       open-webui:
         condition: service_healthy
-    # Убран sleep 15 — теперь ждём healthcheck open-webui
     command: python /scripts/init-openwebui.py
     networks:
       - webui-net
