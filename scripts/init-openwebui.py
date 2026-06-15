@@ -6,9 +6,14 @@ init-openwebui.py — запускается один раз при старте
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора (логин или создание)
 3. Создаёт/обновляет Pipe Function с SSL-обходом и streaming
-4. Подключает MCP Tool Servers (SSE) — поддерживает несколько через MCP_SERVER_URLS
-   Если сервер уже зарегистрирован с неправильным типом (openapi вместо mcp) —
-   удаляет и перерегистрирует с type=mcp.
+4. Подключает MCP Tool Servers — поддерживает несколько через MCP_SERVER_URLS
+
+API Open WebUI v0.8.10:
+  - Создание функции:  POST /api/v1/functions/create
+  - Обновление функции: POST /api/v1/functions/id/{id}/update
+  - Получить MCP-сервера:  GET  /api/v1/configs/tool_servers
+  - Записать MCP-сервера:  POST /api/v1/configs/tool_servers
+    body: {"TOOL_SERVER_CONNECTIONS": [{"url": ..., "type": "mcp", ...}]}
 """
 
 import os
@@ -201,13 +206,13 @@ def get_token():
 def upsert_pipe_function(token):
     """Создаём или обновляем Pipe Function.
 
-    Open WebUI v0.8+:
+    Open WebUI v0.8.10 (backend/open_webui/routers/functions.py):
       - создание:   POST /api/v1/functions/create
-      - обновление: PUT  /api/v1/functions/{id}   ← не POST /{id}/update
+      - обновление: POST /api/v1/functions/id/{id}/update
     """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    r = requests.get(f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
+    r = requests.get(f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
     payload = {
         "id": PIPE_FUNCTION_ID,
         "name": PIPE_FUNCTION_NAME,
@@ -216,9 +221,9 @@ def upsert_pipe_function(token):
     }
 
     if r.status_code == 200:
-        # PUT /api/v1/functions/{id} — правильный эндпоинт обновления в v0.8+
-        r = requests.put(
-            f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}",
+        # POST /api/v1/functions/id/{id}/update — v0.8.10
+        r = requests.post(
+            f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}/update",
             headers=headers, json=payload, timeout=10,
         )
         print(f"[OK] Pipe function updated: {r.status_code}")
@@ -234,9 +239,22 @@ def upsert_pipe_function(token):
 
 
 def add_mcp_tool_servers(token):
-    """Добавляем MCP SSE tool servers (поддерживает несколько).
-    Если сервер зарегистрирован с неправильным типом (openapi вместо mcp) —
-    удаляем и перерегистрируем с type=mcp.
+    """Добавляем MCP сервера через /api/v1/configs/tool_servers.
+
+    Open WebUI v0.8.10 (backend/open_webui/routers/configs.py):
+      - GET  /api/v1/configs/tool_servers  → {"TOOL_SERVER_CONNECTIONS": [...]}
+      - POST /api/v1/configs/tool_servers  → {"TOOL_SERVER_CONNECTIONS": [...]}
+
+    Формат записи:
+      {
+        "url": "http://host:port/sse",
+        "path": "/sse",
+        "type": "mcp",
+        "auth_type": "none",
+        "key": "",
+        "headers": null,
+        "config": {"enable": true}
+      }
     """
     servers = parse_mcp_servers()
     if not servers:
@@ -245,56 +263,64 @@ def add_mcp_tool_servers(token):
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Получаем список уже зарегистрированных серверов: {url -> server_dict}
-    existing = {}
-    r = requests.get(f"{BASE_URL}/api/v1/tools/servers", headers=headers, timeout=10)
-    if r.status_code == 200:
-        try:
-            data = r.json()
-            if isinstance(data, list):
-                for srv in data:
-                    existing[srv.get("url", "")] = srv
-            else:
-                print(f"[WARN] Unexpected format from /tools/servers: {type(data)}")
-        except Exception as e:
-            print(f"[WARN] Could not parse /tools/servers: {e} — body: {r.text[:200]}")
+    # Получаем текущий список подключений
+    r = requests.get(f"{BASE_URL}/api/v1/configs/tool_servers", headers=headers, timeout=10)
+    if r.status_code != 200:
+        print(f"[WARN] GET /configs/tool_servers returned {r.status_code}: {r.text[:200]}")
+        existing_connections = []
     else:
-        print(f"[WARN] GET /tools/servers returned {r.status_code}: {r.text[:200]}")
+        try:
+            existing_connections = r.json().get("TOOL_SERVER_CONNECTIONS", [])
+        except Exception as e:
+            print(f"[WARN] Could not parse /configs/tool_servers: {e}")
+            existing_connections = []
+
+    # Индекс существующих URL для быстрой проверки
+    existing_urls = {c.get("url", "") for c in existing_connections}
+
+    new_connections = list(existing_connections)  # не трогаем уже подключённые
+    added = []
 
     for srv in servers:
         url = srv["url"]
-        payload = {
-            "name": srv["name"],
+        # Извлекаем path из URL (напр.: /sse)
+        try:
+            from urllib.parse import urlparse
+            path = urlparse(url).path or "/sse"
+        except Exception:
+            path = "/sse"
+
+        if url in existing_urls:
+            print(f"[OK] MCP server already registered: {url}")
+            continue
+
+        new_connections.append({
             "url": url,
-            "description": srv["description"],
-            "auth_type": "none",
+            "path": path,
             "type": "mcp",
-        }
+            "auth_type": "none",
+            "key": "",
+            "headers": None,
+            "config": {"enable": True},
+        })
+        added.append(url)
 
-        if url in existing:
-            existing_type = existing[url].get("type", "")
-            if existing_type == "mcp":
-                print(f"[OK] MCP server already registered correctly: {url}")
-                continue
-            # Тип неправильный (openapi) — удаляем и перерегистрируем
-            server_id = existing[url].get("id", "")
-            if server_id:
-                rd = requests.delete(
-                    f"{BASE_URL}/api/v1/tools/servers/{server_id}",
-                    headers=headers, timeout=10,
-                )
-                print(f"[..] Deleted old server {url} (type={existing_type}): {rd.status_code}")
-            else:
-                print(f"[WARN] Cannot delete server {url}: no id in response, will try to add anyway")
+    if not added:
+        print("[OK] All MCP servers already registered")
+        return
 
-        r = requests.post(
-            f"{BASE_URL}/api/v1/tools/servers",
-            headers=headers, json=payload, timeout=15,
-        )
-        if r.status_code in (200, 201):
-            print(f"[OK] MCP server added: {url} (name={srv['name']})")
-        else:
-            print(f"[WARN] MCP server {url}: {r.status_code} {r.text[:300]}")
+    # Сохраняем полный список обратно
+    r = requests.post(
+        f"{BASE_URL}/api/v1/configs/tool_servers",
+        headers=headers,
+        json={"TOOL_SERVER_CONNECTIONS": new_connections},
+        timeout=15,
+    )
+    if r.status_code in (200, 201):
+        for url in added:
+            print(f"[OK] MCP server added: {url}")
+    else:
+        print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
 
 
 def main():
