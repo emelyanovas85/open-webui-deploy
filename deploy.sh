@@ -48,7 +48,7 @@ APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
 COMPOSE_FILE="docker-compose.yml"
 OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.8.10"
-PYTHON_INIT_IMAGE="python:3.11-slim"
+INIT_IMAGE="open-webui-init:latest"
 FORCE_IMAGE=false
 HTTPS_PROXY_URL=""
 
@@ -131,7 +131,7 @@ log "Используем: ${DOCKER_COMPOSE}"
 log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
-  docker_pull "${OPEN_WEBUI_IMAGE}" || error "Не удалось загрузить ${OPEN_WEBUI_IMAGE}. Проверьте доступ в интернет или укажите прокси: ./deploy.sh --proxy http://proxy:3128"
+  docker_pull "${OPEN_WEBUI_IMAGE}" || error "Не удалось загрузить ${OPEN_WEBUI_IMAGE}."
 fi
 LOCAL_IMAGE_ID=$(docker image inspect "${OPEN_WEBUI_IMAGE}" --format '{{.Id}}')
 ok "Образ найден (ID: ${LOCAL_IMAGE_ID:7:12})"
@@ -151,36 +151,34 @@ if [[ "${FORCE_IMAGE}" == "false" ]]; then
 fi
 
 if [[ "${NEED_TRANSFER}" == "true" ]]; then
-  log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST} (docker save | ssh docker load)..."
+  log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST}..."
   docker save "${OPEN_WEBUI_IMAGE}" | $SSH_CMD 'docker load'
   ok "Образ open-webui загружен на ${REMOTE_HOST}"
 fi
 
-# ── Проверка и передача python:3.11-slim для init-контейнера ──────────────────
-log "Проверка образа init-контейнера ${PYTHON_INIT_IMAGE} локально..."
-if ! docker image inspect "${PYTHON_INIT_IMAGE}" >/dev/null 2>&1; then
-  warn "Локальный образ ${PYTHON_INIT_IMAGE} не найден — запускаем docker pull..."
-  docker_pull "${PYTHON_INIT_IMAGE}" || error "Не удалось загрузить ${PYTHON_INIT_IMAGE}. Укажите прокси: ./deploy.sh --proxy http://proxy:3128"
-fi
-LOCAL_PYTHON_ID=$(docker image inspect "${PYTHON_INIT_IMAGE}" --format '{{.Id}}')
-ok "Образ init-контейнера найден (ID: ${LOCAL_PYTHON_ID:7:12})"
+# ── Сборка и передача open-webui-init образа ──────────────────────────────────
+log "Сборка образа ${INIT_IMAGE} локально из scripts/Dockerfile..."
+docker build -t "${INIT_IMAGE}" "${SCRIPT_DIR}/scripts" \
+  || error "Не удалось собрать образ ${INIT_IMAGE}"
+LOCAL_INIT_ID=$(docker image inspect "${INIT_IMAGE}" --format '{{.Id}}')
+ok "Образ ${INIT_IMAGE} собран (ID: ${LOCAL_INIT_ID:7:12})"
 
-NEED_PYTHON_TRANSFER=true
+NEED_INIT_TRANSFER=true
 if [[ "${FORCE_IMAGE}" == "false" ]]; then
-  log "Проверка ${PYTHON_INIT_IMAGE} на ${REMOTE_HOST}..."
-  REMOTE_PYTHON_ID=$($SSH_CMD "docker image inspect ${PYTHON_INIT_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
-  if [[ "${REMOTE_PYTHON_ID}" == "${LOCAL_PYTHON_ID}" ]]; then
-    ok "Образ python:3.11-slim на сервере актуален — передача пропущена"
-    NEED_PYTHON_TRANSFER=false
+  log "Проверка ${INIT_IMAGE} на ${REMOTE_HOST}..."
+  REMOTE_INIT_ID=$($SSH_CMD "docker image inspect ${INIT_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
+  if [[ "${REMOTE_INIT_ID}" == "${LOCAL_INIT_ID}" ]]; then
+    ok "Образ ${INIT_IMAGE} на сервере актуален — передача пропущена"
+    NEED_INIT_TRANSFER=false
   else
-    log "Образ python:3.11-slim на сервере отсутствует или устарел — будет передан"
+    log "Образ ${INIT_IMAGE} на сервере отсутствует или устарел — будет передан"
   fi
 fi
 
-if [[ "${NEED_PYTHON_TRANSFER}" == "true" ]]; then
-  log "Передача образа ${PYTHON_INIT_IMAGE} на ${REMOTE_HOST}..."
-  docker save "${PYTHON_INIT_IMAGE}" | $SSH_CMD 'docker load'
-  ok "Образ python:3.11-slim загружен на ${REMOTE_HOST}"
+if [[ "${NEED_INIT_TRANSFER}" == "true" ]]; then
+  log "Передача образа ${INIT_IMAGE} на ${REMOTE_HOST}..."
+  docker save "${INIT_IMAGE}" | $SSH_CMD 'docker load'
+  ok "Образ ${INIT_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
