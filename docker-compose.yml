@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.8.10
+    image: ghcr.io/open-webui/open-webui:v0.9.6
     container_name: open-webui
     restart: unless-stopped
     ports:
@@ -45,6 +45,9 @@ services:
       - https_proxy=
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
       - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
+
+      # ── MCP: настраиваемый таймаут инициализации (новое в v0.9.6) ─────────
+      - MCP_INITIALIZE_TIMEOUT=${MCP_INITIALIZE_TIMEOUT:-30}
 
       # ── Webhook integration ───────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
