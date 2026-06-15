@@ -34,8 +34,8 @@ services:
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
       # ── Прокси: исключаем локальные сервисы ───────────────────────────────
-      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.1.5.97}
-      - no_proxy=${no_proxy:-localhost,127.0.0.1,10.1.5.97}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
+      - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
 
       # ── MCP Tool Server ───────────────────────────────────────────────────
       - MCP_SERVER_URL=${MCP_SERVER_URL:-}
@@ -58,6 +58,11 @@ services:
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
       - MCP_SERVER_URL=${MCP_SERVER_URL:-}
+      # ── Прокси для pip install (доступ к pypi.org) ────────────────────────
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
+      - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
     depends_on:
       - open-webui
     command: >
@@ -84,21 +89,21 @@ services:
       - with-ollama
 
   # ── Webhook Handler (MR_Checker) ──────────────────────────────────────────
-  webhook-handler:
-    build:
-      context: ./mr-checker
-      dockerfile: Dockerfile
-    container_name: webhook-handler
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
-      - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
-    networks:
-      - webui-net
-    profiles:
-      - with-webhook
+  # webhook-handler:
+  #   build:
+  #     context: ./mr-checker
+  #     dockerfile: Dockerfile
+  #   container_name: webhook-handler
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:8080"
+  #   environment:
+  #     - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
+  #     - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
+  #   networks:
+  #     - webui-net
+  #   profiles:
+  #     - with-webhook
 
 volumes:
   open-webui-data:
