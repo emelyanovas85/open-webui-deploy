@@ -217,12 +217,13 @@ def add_mcp_tool_server(token):
                 print(f"[OK] MCP tool server already registered: {MCP_SERVER_URL}")
                 return
 
-    # Добавляем новый
+    # Добавляем новый — тип mcp для SSE-серверов (supergateway)
     payload = {
-        "name": "java_context_mcp",
+        "name": "gitlab_mcp",
         "url": MCP_SERVER_URL,
-        "description": "Java Class Context MCP (SSE)",
+        "description": "GitLab MCP (SSE via supergateway)",
         "auth_type": "none",
+        "type": "mcp",
     }
     r = requests.post(
         f"{BASE_URL}/api/v1/tools/servers",
