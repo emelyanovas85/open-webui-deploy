@@ -64,16 +64,14 @@ services:
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
       - MCP_SERVER_URL=${MCP_SERVER_URL:-}
-      # ── Прокси для pip install (доступ к pypi.org) ────────────────────────
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
-      - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
+      # ── Прокси для запросов к open-webui внутри Docker-сети ──────────────────
+      - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
+      - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
     depends_on:
       - open-webui
     command: >
       bash -c "
-        pip install requests --quiet &&
+        pip install requests --quiet --proxy http://10.1.26.2:8888 &&
         echo 'Waiting for Open WebUI to start...' &&
         sleep 15 &&
         python /scripts/init-openwebui.py
