@@ -6,7 +6,7 @@ init-openwebui.py — запускается один раз при старте
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора (логин или создание)
 3. Создаёт/обновляет Pipe Function с SSL-обходом и streaming
-4. Подключает MCP Tool Server (SSE)
+4. Подключает MCP Tool Servers (SSE) — поддерживает несколько через MCP_SERVER_URLS
 """
 
 import os
@@ -18,7 +18,37 @@ import requests
 BASE_URL = os.environ.get("WEBUI_BASE_URL", "http://open-webui:8080").rstrip("/")
 ADMIN_EMAIL = os.environ.get("WEBUI_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.environ.get("WEBUI_ADMIN_PASSWORD", "")
-MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "")
+
+# Поддержка нескольких MCP серверов через MCP_SERVER_URLS
+# Формат: url1::name1::desc1,url2::name2::desc2
+# Или старый формат: просто URL (обратная совместимость через MCP_SERVER_URL)
+MCP_SERVER_URLS_RAW = os.environ.get("MCP_SERVER_URLS", "")
+MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
+
+
+def parse_mcp_servers():
+    """Парсим список MCP серверов из переменных окружения."""
+    servers = []
+
+    if MCP_SERVER_URLS_RAW:
+        for entry in MCP_SERVER_URLS_RAW.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split("::")
+            url = parts[0].strip()
+            name = parts[1].strip() if len(parts) > 1 else url.split("/")[2].replace(":", "_")
+            desc = parts[2].strip() if len(parts) > 2 else name
+            servers.append({"url": url, "name": name, "description": desc})
+    elif MCP_SERVER_URL_LEGACY:
+        servers.append({
+            "url": MCP_SERVER_URL_LEGACY,
+            "name": "mcp_server",
+            "description": "MCP Tool Server",
+        })
+
+    return servers
+
 
 PIPE_FUNCTION_ID = "qwen_cbr"
 PIPE_FUNCTION_NAME = "Qwen3.5 CBR"
@@ -137,7 +167,6 @@ def wait_for_webui(max_retries=30, delay=5):
 
 def get_token():
     """Получаем JWT-токен администратора."""
-    # Пробуем войти
     r = requests.post(
         f"{BASE_URL}/api/v1/auths/signin",
         json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
@@ -148,7 +177,6 @@ def get_token():
         print(f"[OK] Signed in as {ADMIN_EMAIL}")
         return token
 
-    # Если пользователь ещё не создан — регистрируем первого (он станет admin)
     print(f"[..] Login failed ({r.status_code}), trying signup...")
     r = requests.post(
         f"{BASE_URL}/api/v1/auths/signup",
@@ -172,7 +200,6 @@ def upsert_pipe_function(token):
     """Создаём или обновляем Pipe Function."""
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Проверяем существует ли уже
     r = requests.get(f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
     payload = {
         "id": PIPE_FUNCTION_ID,
@@ -182,14 +209,12 @@ def upsert_pipe_function(token):
     }
 
     if r.status_code == 200:
-        # Обновляем
         r = requests.post(
             f"{BASE_URL}/api/v1/functions/{PIPE_FUNCTION_ID}/update",
             headers=headers, json=payload, timeout=10,
         )
         print(f"[OK] Pipe function updated: {r.status_code}")
     else:
-        # Создаём
         r = requests.post(
             f"{BASE_URL}/api/v1/functions/create",
             headers=headers, json=payload, timeout=10,
@@ -200,39 +225,43 @@ def upsert_pipe_function(token):
         print(f"[WARN] Pipe function response: {r.text[:300]}")
 
 
-def add_mcp_tool_server(token):
-    """Добавляем MCP SSE tool server."""
-    if not MCP_SERVER_URL:
-        print("[SKIP] MCP_SERVER_URL not set, skipping")
+def add_mcp_tool_servers(token):
+    """Добавляем MCP SSE tool servers (поддерживает несколько)."""
+    servers = parse_mcp_servers()
+    if not servers:
+        print("[SKIP] No MCP servers configured (MCP_SERVER_URLS not set), skipping")
         return
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Получаем список существующих tool servers
+    # Получаем список уже зарегистрированных серверов
+    existing_urls = set()
     r = requests.get(f"{BASE_URL}/api/v1/tools/servers", headers=headers, timeout=10)
     if r.status_code == 200:
-        existing = r.json()
-        for srv in existing:
-            if srv.get("url") == MCP_SERVER_URL:
-                print(f"[OK] MCP tool server already registered: {MCP_SERVER_URL}")
-                return
+        for srv in r.json():
+            existing_urls.add(srv.get("url", ""))
 
-    # Добавляем новый — тип mcp для SSE-серверов (supergateway)
-    payload = {
-        "name": "gitlab_mcp",
-        "url": MCP_SERVER_URL,
-        "description": "GitLab MCP (SSE via supergateway)",
-        "auth_type": "none",
-        "type": "mcp",
-    }
-    r = requests.post(
-        f"{BASE_URL}/api/v1/tools/servers",
-        headers=headers, json=payload, timeout=15,
-    )
-    if r.status_code in (200, 201):
-        print(f"[OK] MCP tool server added: {MCP_SERVER_URL}")
-    else:
-        print(f"[WARN] MCP tool server: {r.status_code} {r.text[:300]}")
+    for srv in servers:
+        url = srv["url"]
+        if url in existing_urls:
+            print(f"[OK] MCP server already registered: {url}")
+            continue
+
+        payload = {
+            "name": srv["name"],
+            "url": url,
+            "description": srv["description"],
+            "auth_type": "none",
+            "type": "mcp",
+        }
+        r = requests.post(
+            f"{BASE_URL}/api/v1/tools/servers",
+            headers=headers, json=payload, timeout=15,
+        )
+        if r.status_code in (200, 201):
+            print(f"[OK] MCP server added: {url} (name={srv['name']})")
+        else:
+            print(f"[WARN] MCP server {url}: {r.status_code} {r.text[:300]}")
 
 
 def main():
@@ -248,7 +277,7 @@ def main():
         sys.exit(1)
 
     upsert_pipe_function(token)
-    add_mcp_tool_server(token)
+    add_mcp_tool_servers(token)
     print("[DONE] Init completed successfully")
 
 

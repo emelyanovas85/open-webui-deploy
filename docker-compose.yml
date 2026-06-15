@@ -41,9 +41,6 @@ services:
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
       - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
 
-      # ── MCP Tool Server ───────────────────────────────────────────────────
-      - MCP_SERVER_URL=${MCP_SERVER_URL:-}
-
       # ── Webhook integration ───────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
@@ -62,7 +59,7 @@ services:
       - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
-      - MCP_SERVER_URL=${MCP_SERVER_URL:-}
+      - MCP_SERVER_URLS=${MCP_SERVER_URLS:-}
       - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
       - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
     depends_on:
@@ -88,23 +85,6 @@ services:
       - webui-net
     profiles:
       - with-ollama
-
-  # ── Webhook Handler (MR_Checker) ──────────────────────────────────────────
-  # webhook-handler:
-  #   build:
-  #     context: ./mr-checker
-  #     dockerfile: Dockerfile
-  #   container_name: webhook-handler
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8080:8080"
-  #   environment:
-  #     - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
-  #     - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
-  #   networks:
-  #     - webui-net
-  #   profiles:
-  #     - with-webhook
 
 volumes:
   open-webui-data:
