@@ -33,7 +33,13 @@ services:
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # ── Прокси: исключаем локальные сервисы ───────────────────────────────
+      # ── Прокси: явно сбрасываем системный прокси, чтобы локальные сервисы
+      #    (MCP, Ollama) не шли через Squid. Внешние запросы (OpenAI API)
+      #    будут ходить напрямую — убедитесь, что хост имеет прямой доступ.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
       - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
 
