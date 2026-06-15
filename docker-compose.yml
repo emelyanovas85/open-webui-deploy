@@ -44,16 +44,25 @@ services:
       # ── Webhook integration ───────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     networks:
       - webui-net
 
-  # ── Init-контейнер: собирается локально, requests уже внутри ─────────────
+  # ── Init-контейнер: запускается при каждом деплое ─────────────────────────
   open-webui-init:
     build:
       context: ./scripts
       dockerfile: Dockerfile
     image: open-webui-init:latest
     container_name: open-webui-init
+    # restart: "no" убран — контейнер пересоздаётся при каждом `docker compose up`
+    # Используйте `docker compose up --force-recreate open-webui-init` или
+    # `docker compose run --rm open-webui-init` для ручного запуска
     restart: "no"
     environment:
       - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
@@ -63,13 +72,10 @@ services:
       - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
       - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
     depends_on:
-      - open-webui
-    command: >
-      bash -c "
-        echo 'Waiting for Open WebUI to start...' &&
-        sleep 15 &&
-        python /scripts/init-openwebui.py
-      "
+      open-webui:
+        condition: service_healthy
+    # Убран sleep 15 — теперь ждём healthcheck open-webui
+    command: python /scripts/init-openwebui.py
     networks:
       - webui-net
 
