@@ -33,9 +33,7 @@ services:
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # ── Прокси: явно сбрасываем системный прокси, чтобы локальные сервисы
-      #    (MCP, Ollama) не шли через Squid. Внешние запросы (OpenAI API)
-      #    будут ходить напрямую — убедитесь, что хост имеет прямой доступ.
+      # ── Прокси: явно сбрасываем системный прокси ─────────────────────────────
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - http_proxy=
@@ -52,26 +50,25 @@ services:
     networks:
       - webui-net
 
-  # ── Init-контейнер: создаёт admin + pipe function + MCP tool server ───────
+  # ── Init-контейнер: собирается локально, requests уже внутри ─────────────
   open-webui-init:
-    image: python:3.11-slim
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile
+    image: open-webui-init:latest
     container_name: open-webui-init
     restart: "no"
-    volumes:
-      - ./scripts:/scripts:ro
     environment:
       - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
       - MCP_SERVER_URL=${MCP_SERVER_URL:-}
-      # ── Прокси для запросов к open-webui внутри Docker-сети ──────────────────
       - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
       - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
     depends_on:
       - open-webui
     command: >
       bash -c "
-        pip install requests --quiet --proxy http://10.1.26.2:8888 &&
         echo 'Waiting for Open WebUI to start...' &&
         sleep 15 &&
         python /scripts/init-openwebui.py
