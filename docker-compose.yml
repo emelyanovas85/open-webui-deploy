@@ -8,8 +8,9 @@ services:
     ports:
       - "8087:8080"
     volumes:
-      - open-webui-data:/app/backend/data
       - ./scripts:/app/scripts:ro
+      # Нет персистентного волюма — база чистая при каждом деплое.
+      # Всё настраивается через init-скрипт: аккаунт, Pipe Function, MCP-сервера.
     environment:
       # ── LLM Provider (OpenAI-compatible API) ───────────────────────────────────
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -87,7 +88,6 @@ services:
       - with-ollama
 
 volumes:
-  open-webui-data:
   ollama-data:
 
 networks:
