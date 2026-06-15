@@ -7,6 +7,8 @@ init-openwebui.py — запускается один раз при старте
 2. Получает JWT-токен администратора (логин или создание)
 3. Создаёт/обновляет Pipe Function с SSL-обходом и streaming
 4. Подключает MCP Tool Servers (SSE) — поддерживает несколько через MCP_SERVER_URLS
+   Если сервер уже зарегистрирован с неправильным типом (openapi вместо mcp) —
+   удаляет и перерегистрирует с type=mcp.
 """
 
 import os
@@ -226,7 +228,10 @@ def upsert_pipe_function(token):
 
 
 def add_mcp_tool_servers(token):
-    """Добавляем MCP SSE tool servers (поддерживает несколько)."""
+    """Добавляем MCP SSE tool servers (поддерживает несколько).
+    Если сервер зарегистрирован с неправильным типом (openapi вместо mcp) —
+    удаляем и перерегистрируем с type=mcp.
+    """
     servers = parse_mcp_servers()
     if not servers:
         print("[SKIP] No MCP servers configured (MCP_SERVER_URLS not set), skipping")
@@ -234,19 +239,15 @@ def add_mcp_tool_servers(token):
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Получаем список уже зарегистрированных серверов
-    existing_urls = set()
+    # Получаем список уже зарегистрированных серверов: {url -> server_dict}
+    existing = {}
     r = requests.get(f"{BASE_URL}/api/v1/tools/servers", headers=headers, timeout=10)
     if r.status_code == 200:
         for srv in r.json():
-            existing_urls.add(srv.get("url", ""))
+            existing[srv.get("url", "")] = srv
 
     for srv in servers:
         url = srv["url"]
-        if url in existing_urls:
-            print(f"[OK] MCP server already registered: {url}")
-            continue
-
         payload = {
             "name": srv["name"],
             "url": url,
@@ -254,6 +255,23 @@ def add_mcp_tool_servers(token):
             "auth_type": "none",
             "type": "mcp",
         }
+
+        if url in existing:
+            existing_type = existing[url].get("type", "")
+            if existing_type == "mcp":
+                print(f"[OK] MCP server already registered correctly: {url}")
+                continue
+            # Тип неправильный (openapi) — удаляем и перерегистрируем
+            server_id = existing[url].get("id", "")
+            if server_id:
+                rd = requests.delete(
+                    f"{BASE_URL}/api/v1/tools/servers/{server_id}",
+                    headers=headers, timeout=10,
+                )
+                print(f"[..] Deleted old server {url} (type={existing_type}): {rd.status_code}")
+            else:
+                print(f"[WARN] Cannot delete server {url}: no id in response, will try to add anyway")
+
         r = requests.post(
             f"{BASE_URL}/api/v1/tools/servers",
             headers=headers, json=payload, timeout=15,
