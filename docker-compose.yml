@@ -44,20 +44,13 @@ services:
       # ── Webhook integration ───────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health | grep -q '\"status\":true' || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 60s
     networks:
       - webui-net
 
-  # ── Init-контейнер: запускается при каждом деплое ─────────────────────────
+  # ── Init-контейнер: запускается вручную из deploy.sh после healthcheck ────
+  # docker-compose v1 не поддерживает depends_on: condition: service_healthy,
+  # поэтому запуск управляется через deploy.sh: docker-compose run --rm open-webui-init
   open-webui-init:
-    build:
-      context: ./scripts
-      dockerfile: Dockerfile
     image: open-webui-init:latest
     container_name: open-webui-init
     restart: "no"
@@ -68,9 +61,6 @@ services:
       - MCP_SERVER_URLS=${MCP_SERVER_URLS:-}
       - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
       - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
-    depends_on:
-      open-webui:
-        condition: service_healthy
     command: python /scripts/init-openwebui.py
     networks:
       - webui-net

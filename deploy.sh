@@ -218,7 +218,6 @@ tar -xzf "\${APP_DIR}/app.tar.gz" -C "\${APP_DIR}"
 rm -f "\${APP_DIR}/app.tar.gz"
 ok "Конфигурация распакована в \${APP_DIR} (.env взят из git)"
 
-# Убедимся что scripts/ исполняемые
 chmod +x "\${APP_DIR}/scripts/"*.py 2>/dev/null || true
 
 PORT_IN_USE=false
@@ -253,95 +252,70 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
+# Останавливаем предыдущий стек (только open-webui, init запускаем отдельно)
 if docker ps -a --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
   log "Остановка предыдущего стека..."
   eval "\${DC_CMD} down --remove-orphans" || true
+  docker rm -f open-webui-init 2>/dev/null || true
   ok "Стек остановлен"
 else
   log "Запущенных контейнеров не найдено — первый запуск"
 fi
 
-log "Запуск стека через \${COMPOSE_FILE}..."
-eval "\${DC_CMD} up -d --no-build"
-ok "Стек запущен"
+# Запускаем ТОЛЬКО open-webui (init запустим вручную после healthcheck)
+log "Запуск open-webui..."
+eval "\${DC_CMD} up -d --no-build open-webui"
+ok "open-webui запущен"
 
-# ── Healthcheck: ждём готовности Open WebUI по /health ────────────────────────
+# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
-ELAPSED=0
 HEALTHY=false
 START_TS=\$(date +%s)
 
-while [[ \$ELAPSED -lt \$MAX_WAIT ]]; do
+while true; do
+  ELAPSED=\$(( \$(date +%s) - START_TS ))
+  [[ \$ELAPSED -ge \$MAX_WAIT ]] && break
+
   CONTAINER_STATUS=\$(docker inspect open-webui --format '{{.State.Status}}' 2>/dev/null || echo "missing")
   if [[ "\${CONTAINER_STATUS}" == "exited" || "\${CONTAINER_STATUS}" == "dead" || "\${CONTAINER_STATUS}" == "missing" ]]; then
     echo ""
-    warn "Контейнер open-webui остановился со статусом '\${CONTAINER_STATUS}'"
-    warn "Последние логи:"
+    warn "Контейнер open-webui остановился (статус: \${CONTAINER_STATUS})"
     docker logs open-webui --tail=40 2>&1 || true
     fail "Деплой прерван — контейнер упал"
   fi
 
-  HEALTH_RESPONSE=\$(curl -sf --noproxy '*' --max-time 3 "http://localhost:\${APP_PORT}/health" 2>/dev/null || echo "")
-  if echo "\${HEALTH_RESPONSE}" | grep -q '"status":.*true'; then
+  HEALTH_RESPONSE=\$(wget -qO- --no-proxy "http://localhost:\${APP_PORT}/health" 2>/dev/null || echo "")
+  if echo "\${HEALTH_RESPONSE}" | grep -q '"status":true'; then
     HEALTHY=true
     ELAPSED=\$(( \$(date +%s) - START_TS ))
     break
   fi
 
   if (( ELAPSED % 30 == 0 && ELAPSED > 0 )); then
-    CONTAINER_DETAIL=\$(docker inspect open-webui --format '{{.State.Status}} ({{.State.Health.Status}})' 2>/dev/null || echo "?")
-    echo -e "\n  ⏳ \${ELAPSED}с — контейнер: \${CONTAINER_DETAIL}, /health: \${HEALTH_RESPONSE:-нет ответа}"
+    echo -e "\n  ⏳ \${ELAPSED}с — /health: \${HEALTH_RESPONSE:-нет ответа}"
   else
     printf "."
   fi
   sleep 3
-  ELAPSED=\$(( \$(date +%s) - START_TS ))
 done
 echo ""
 
 if [[ "\$HEALTHY" != "true" ]]; then
-  warn "Open WebUI /health не вернул {status: true} за \${MAX_WAIT} сек."
-  echo ""
-  warn "Статус контейнера:"
-  docker inspect open-webui --format 'Status: {{.State.Status}}  ExitCode: {{.State.ExitCode}}' 2>/dev/null || true
-  echo ""
-  warn "Последние логи контейнера:"
+  warn "Open WebUI не ответил за \${MAX_WAIT} сек."
   docker logs open-webui --tail=60 2>&1 || true
   exit 1
 fi
-
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Ждём завершения init-контейнера ───────────────────────────────────────────
-log "Ожидание завершения init-контейнера (admin + pipe function + MCP)..."
-INIT_MAX_WAIT=300
-INIT_ELAPSED=0
-INIT_START=\$(date +%s)
-
-while [[ \$INIT_ELAPSED -lt \$INIT_MAX_WAIT ]]; do
-  INIT_STATUS=\$(docker inspect open-webui-init --format '{{.State.Status}}' 2>/dev/null || echo "missing")
-  if [[ "\${INIT_STATUS}" == "exited" ]]; then
-    INIT_EXIT_CODE=\$(docker inspect open-webui-init --format '{{.State.ExitCode}}' 2>/dev/null || echo "1")
-    if [[ "\${INIT_EXIT_CODE}" == "0" ]]; then
-      ok "Init-контейнер завершился успешно"
-    else
-      warn "Init-контейнер завершился с кодом \${INIT_EXIT_CODE}"
-    fi
-    break
-  fi
-  if [[ "\${INIT_STATUS}" == "missing" ]]; then
-    warn "Init-контейнер не найден — пропускаем ожидание"
-    break
-  fi
-  printf "."
-  sleep 3
-  INIT_ELAPSED=\$(( \$(date +%s) - INIT_START ))
-done
-echo ""
-
-log "Логи init-контейнера:"
-docker logs open-webui-init 2>&1 || true
+# ── Запуск init-контейнера вручную (docker-compose v1 не поддерживает depends_on condition) ──
+log "Запуск init-контейнера (admin + pipe function + MCP)..."
+docker rm -f open-webui-init 2>/dev/null || true
+if eval "\${DC_CMD} run --rm --name open-webui-init open-webui-init"; then
+  ok "Init-контейнер завершился успешно"
+else
+  warn "Init-контейнер завершился с ошибкой (см. логи выше)"
+fi
 
 echo ""
 eval "\${DC_CMD} ps"
@@ -349,7 +323,6 @@ echo ""
 ok "Деплой завершён успешно"
 SERVER_IP=\$(hostname -I | awk '{print \$1}')
 echo -e "\${GREEN}  Open WebUI: http://\${SERVER_IP}:\${APP_PORT}/\${NC}"
-echo -e "\${GREEN}  Логин: bugbusters@cbr.ru\${NC}"
 REMOTE_DEPLOY
 
 ok "Деплой на ${REMOTE_HOST} завершён"
