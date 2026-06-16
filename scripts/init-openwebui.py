@@ -5,8 +5,8 @@ init-openwebui.py — запускается один раз при старте
 Что делает:
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
-3. Создаёт/обновляет Pipe Function — модели грузятся динамически
-4. Подключает MCP Tool Servers
+3. Создаёт/обновляет Pipe Function + активирует её
+4. Подключает MCP Tool Servers с понятными именами
 5. Патчит БД: отключает OpenAI connections, фиксит null info
 """
 
@@ -232,6 +232,8 @@ def get_token():
 
 def upsert_pipe_function(token):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Удаляем устаревшие версии
     for old_id in ("qwen_cbr",):
         r = requests.get(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -242,8 +244,13 @@ def upsert_pipe_function(token):
         "id": PIPE_FUNCTION_ID,
         "name": PIPE_FUNCTION_NAME,
         "content": PIPE_FUNCTION_CODE,
-        "meta": {"description": "Dynamic CBR models via SSL-compatible Pipe"},
+        "is_active": True,
+        "meta": {
+            "description": "Dynamic CBR models via SSL-compatible Pipe",
+            "manifest": {"title": PIPE_FUNCTION_NAME},
+        },
     }
+
     r = requests.get(f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
     if r.status_code == 200:
         r = requests.post(
@@ -257,12 +264,31 @@ def upsert_pipe_function(token):
             headers=headers, json=payload, timeout=10,
         )
         print(f"[OK] Pipe function created: {r.status_code}")
+
     if r.status_code not in (200, 201):
         print(f"[WARN] Pipe function response: {r.text[:300]}")
+        return
+
+    # Явно активируем функцию через toggle (is_active=True не всегда проходит через create)
+    tr = requests.post(
+        f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}/toggle",
+        headers=headers, timeout=10,
+    )
+    toggled = tr.json() if tr.status_code == 200 else {}
+    is_active = toggled.get("is_active")
+    if is_active is False:
+        # toggle переключил в False — переключаем обратно
+        tr = requests.post(
+            f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}/toggle",
+            headers=headers, timeout=10,
+        )
+        toggled = tr.json() if tr.status_code == 200 else {}
+        is_active = toggled.get("is_active")
+    print(f"[OK] Pipe function active: {is_active} (toggle status: {tr.status_code})")
 
 
-def make_stub_info(url):
-    return {"id": url, "name": "mcp", "version": "0.1.0"}
+def make_stub_info(url, name="mcp"):
+    return {"id": url, "name": name, "version": "0.1.0"}
 
 
 def add_mcp_tool_servers(token):
@@ -284,9 +310,12 @@ def add_mcp_tool_servers(token):
             print(f"[WARN] Could not parse /configs/tool_servers: {e}")
             existing_connections = []
 
+    # Фиксим null info в существующих
+    url_to_name = {srv["url"]: srv["name"] for srv in servers}
     for c in existing_connections:
         if c.get("info") is None:
-            c["info"] = make_stub_info(c.get("url", ""))
+            name = url_to_name.get(c.get("url", ""), "mcp")
+            c["info"] = make_stub_info(c.get("url", ""), name)
 
     existing_urls = {c.get("url", "") for c in existing_connections}
     new_connections = list(existing_connections)
@@ -312,9 +341,9 @@ def add_mcp_tool_servers(token):
             "key": "",
             "headers": None,
             "config": {"enable": True},
-            "info": make_stub_info(url),
+            "info": make_stub_info(url, srv["name"]),
         })
-        added.append(url)
+        added.append((url, srv["name"]))
 
     if not added and not any(c.get("info") is None for c in existing_connections):
         print("[OK] All MCP servers already registered")
@@ -327,8 +356,8 @@ def add_mcp_tool_servers(token):
         timeout=15,
     )
     if r.status_code in (200, 201):
-        for url in added:
-            print(f"[OK] MCP server added: {url}")
+        for url, name in added:
+            print(f"[OK] MCP server added: {name} -> {url}")
         if not added:
             print("[OK] MCP connections updated (stub info patched)")
     else:
@@ -339,8 +368,9 @@ def patch_db(db_path):
     """
     Патчит БД напрямую:
     1. Отключает все OpenAI connections (если есть) — enabled=False
-    2. Фиксит null info у MCP connections
+    2. Фиксит null info у MCP connections, используя имена из .env
     """
+    url_to_name = {srv["url"]: srv["name"] for srv in parse_mcp_servers()}
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -356,7 +386,6 @@ def patch_db(db_path):
         patched = False
 
         # 1. Отключаем OpenAI connections
-        # Структура в БД v0.9.x: data["openai"]["connections"] = [{"url":..., "key":..., "enabled":True}, ...]
         openai_connections = data.get("openai", {}).get("connections", [])
         disabled_count = 0
         for c in openai_connections:
@@ -369,13 +398,15 @@ def patch_db(db_path):
         else:
             print("[OK] DB: no active OpenAI connections found")
 
-        # 2. Фиксит null info у MCP connections
+        # 2. Фиксит null info у MCP connections с правильным именем
         mcp_connections = data.get("tool_server", {}).get("connections", [])
         for c in mcp_connections:
             if c.get("info") is None:
-                c["info"] = {"id": c.get("url", ""), "name": "mcp", "version": "0.1.0"}
+                url = c.get("url", "")
+                name = url_to_name.get(url, "mcp")
+                c["info"] = {"id": url, "name": name, "version": "0.1.0"}
                 patched = True
-                print(f"[PATCH] Set stub info for MCP {c.get('url', '')}")
+                print(f"[PATCH] Set info for MCP {url} -> name='{name}'")
 
         if patched:
             cur.execute(
@@ -387,7 +418,6 @@ def patch_db(db_path):
         else:
             print("[OK] DB check passed — nothing to patch")
 
-        # Показываем итоговое состояние для отладки
         print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
               f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
         print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
