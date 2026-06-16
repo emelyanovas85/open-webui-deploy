@@ -10,30 +10,36 @@ services:
     volumes:
       - ./scripts:/app/scripts:ro
       - ./openssl-legacy.cnf:/etc/ssl/openssl.cnf:ro
+      - webui-data:/app/backend/data
     environment:
-      # ── LLM Provider ───────────────────────────────────────────────────
+      # ── LLM Provider ─────────────────────────────────────────────────────
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
 
-      # ── Ollama (отключён) ─────────────────────────────────────────────
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      # ── Ollama (отключён) ────────────────────────────────────────────
+      - OLLAMA_BASE_URL=
+      - ENABLE_OLLAMA_API=false
 
-      # ── Security ───────────────────────────────────────────────────
+      # ── Security ──────────────────────────────────────────────
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-changeme-super-secret-key}
       - WEBUI_AUTH=${WEBUI_AUTH:-true}
 
-      # ── Админ ──────────────────────────────────────────────────────
+      # ── Админ ──────────────────────────────────────────────
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
       - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME:-Admin}
 
-      # ── Общие настройки ─────────────────────────────────────────────
+      # ── Общие настройки ────────────────────────────────────────
       - WEBUI_NAME=${WEBUI_NAME:-Open WebUI}
       - DEFAULT_MODELS=${DEFAULT_MODELS:-}
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # ── RAG ───────────────────────────────────────────────────────
+      # ── Task models (заголовки, теги) ─────────────────────────────
+      - TASK_MODEL=${TASK_MODEL:-}
+      - TASK_MODEL_EXTERNAL=${TASK_MODEL_EXTERNAL:-Qwen/Qwen3.5-397B-A17B-GPTQ-Int4}
+
+      # ── RAG ───────────────────────────────────────────────
       - RAG_EMBEDDING_ENGINE=${RAG_EMBEDDING_ENGINE:-openai}
       - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-text-embedding-3-small}
       - ENABLE_RAG_WEB_SEARCH=${ENABLE_RAG_WEB_SEARCH:-false}
@@ -46,7 +52,7 @@ services:
       - CURL_CA_BUNDLE=
       - PYTHONHTTPSVERIFY=0
 
-      # ── Прокси ───────────────────────────────────────────────────────
+      # ── Прокси ─────────────────────────────────────────────────
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - http_proxy=
@@ -54,10 +60,10 @@ services:
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
       - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
 
-      # ── MCP ───────────────────────────────────────────────────────────
+      # ── MCP ───────────────────────────────────────────────────
       - MCP_INITIALIZE_TIMEOUT=${MCP_INITIALIZE_TIMEOUT:-30}
 
-      # ── Webhook ──────────────────────────────────────────────────────
+      # ── Webhook ──────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
     networks:
@@ -67,6 +73,8 @@ services:
     image: open-webui-init:latest
     container_name: open-webui-init
     restart: "no"
+    volumes:
+      - webui-data:/app/backend/data
     environment:
       - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
@@ -93,6 +101,7 @@ services:
 
 volumes:
   ollama-data:
+  webui-data:
 
 networks:
   webui-net:
