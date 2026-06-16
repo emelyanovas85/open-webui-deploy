@@ -26,6 +26,8 @@
 # Скрипт сравнивает Image ID локально и на сервере — если совпадают,
 # передача пропускается. Иначе передаёт образ через docker save | ssh docker load.
 # .env всегда берётся из git (редактируйте его локально и деплойте).
+# Данные Open WebUI (чаты, пользователи, настройки) полностью сбрасываются
+# при каждом деплое (удаление volume webui-data).
 # =============================================================================
 
 set -euo pipefail
@@ -252,15 +254,14 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# Останавливаем предыдущий стек
-if docker ps -a --filter "name=open-webui" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-  log "Остановка предыдущего стека..."
-  eval "\${DC_CMD} down --remove-orphans" || true
-  docker rm -f open-webui-init 2>/dev/null || true
-  ok "Стек остановлен"
-else
-  log "Запущенных контейнеров не найдено — первый запуск"
-fi
+# ── Полная остановка и удаление данных ────────────────────────────────────────
+log "Остановка стека и удаление данных (чистый деплой)..."
+eval "\${DC_CMD} down --remove-orphans --volumes" 2>/dev/null || true
+docker rm -f open-webui open-webui-init 2>/dev/null || true
+# Явное удаление volume на случай если он создан вне compose
+COMPOSE_PROJECT=\$(basename "\${APP_DIR}")
+docker volume rm "\${COMPOSE_PROJECT}_webui-data" 2>/dev/null && ok "Volume webui-data удалён" || true
+ok "Старые данные очищены"
 
 # Запускаем ТОЛЬКО open-webui
 log "Запуск open-webui..."
@@ -308,8 +309,7 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Проверка доступности MCP-серверов через TCP (не curl — SSE не закрывает соединение) ──
-# Формат: "host port"
+# ── Проверка доступности MCP-серверов через TCP ────────────────────────────────
 MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
 log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
@@ -338,11 +338,10 @@ for MCP_ENTRY in "\${MCP_SERVERS[@]}"; do
   fi
 done
 
-# Пауза чтобы Open WebUI успел переподключиться к MCP
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера ────────────────────────────────────────────────────────
+# ── Запуск init-контейнера ────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
 docker rm -f open-webui-init 2>/dev/null || true
 if eval "\${DC_CMD} run --rm --name open-webui-init open-webui-init"; then
