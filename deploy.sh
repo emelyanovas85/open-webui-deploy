@@ -36,9 +36,9 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
 
 log()   { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
-ok()    { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*"; }
-warn()  { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*"; }
-error() { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*" >&2; exit 1; }
+ok()    { echo -e "${GREEN}[$(date '+%H:%M:%S')] \u2713${NC} $*"; }
+warn()  { echo -e "${YELLOW}[$(date '+%H:%M:%S')] \u26a0${NC} $*"; }
+error() { echo -e "${RED}[$(date '+%H:%M:%S')] \u2717${NC} $*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -128,7 +128,7 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Проверка и передача open-webui образа ─────────────────────────────────────
+# ── Проверка и передача open-webui образа ───────────────────────────────────────────────
 log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
@@ -157,7 +157,7 @@ if [[ "${NEED_TRANSFER}" == "true" ]]; then
   ok "Образ open-webui загружен на ${REMOTE_HOST}"
 fi
 
-# ── Сборка и передача open-webui-init образа ──────────────────────────────────
+# ── Сборка и передача open-webui-init образа ──────────────────────────────────────────────
 log "Сборка образа ${INIT_IMAGE} локально из scripts/Dockerfile..."
 docker build -t "${INIT_IMAGE}" "${SCRIPT_DIR}/scripts" \
   || error "Не удалось собрать образ ${INIT_IMAGE}"
@@ -182,7 +182,7 @@ if [[ "${NEED_INIT_TRANSFER}" == "true" ]]; then
   ok "Образ ${INIT_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────
+# ── Конфигурация ────────────────────────────────────────────────────────────────────────────
 log "Подготовка конфигурации (ветка: ${GIT_BRANCH})..."
 LOCAL_ARCHIVE="$(mktemp /tmp/open-webui-deploy-XXXXXX.tar.gz)"
 git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHIVE}" \
@@ -207,10 +207,10 @@ COMPOSE_FILE="${COMPOSE_FILE}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
-log()  { echo -e "\${BLUE}  →\${NC} \$*"; }
-ok()   { echo -e "\${GREEN}  ✓\${NC} \$*"; }
-warn() { echo -e "\${YELLOW}  ⚠\${NC} \$*"; }
-fail() { echo -e "\${RED}  ✗\${NC} \$*" >&2; exit 1; }
+log()  { echo -e "\${BLUE}  \u2192\${NC} \$*"; }
+ok()   { echo -e "\${GREEN}  \u2713\${NC} \$*"; }
+warn() { echo -e "\${YELLOW}  \u26a0\${NC} \$*"; }
+fail() { echo -e "\${RED}  \u2717\${NC} \$*" >&2; exit 1; }
 
 [[ "\${APP_DIR}" == \~* ]] && APP_DIR="\${HOME}/\${APP_DIR#\~/}"
 DC_CMD="\${DOCKER_COMPOSE} -f \${APP_DIR}/\${COMPOSE_FILE}"
@@ -254,11 +254,10 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# ── Полная остановка и удаление данных ────────────────────────────────────────
+# ── Полная остановка и удаление данных ──────────────────────────────────────────────────────────────────────────────────
 log "Остановка стека и удаление данных (чистый деплой)..."
 eval "\${DC_CMD} down --remove-orphans --volumes" 2>/dev/null || true
 docker rm -f open-webui open-webui-init 2>/dev/null || true
-# Явное удаление volume на случай если он создан вне compose
 COMPOSE_PROJECT=\$(basename "\${APP_DIR}")
 docker volume rm "\${COMPOSE_PROJECT}_webui-data" 2>/dev/null && ok "Volume webui-data удалён" || true
 ok "Старые данные очищены"
@@ -268,7 +267,7 @@ log "Запуск open-webui..."
 eval "\${DC_CMD} up -d --no-build open-webui"
 ok "open-webui запущен"
 
-# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────
+# ── Ждём готовности Open WebUI по /health ────────────────────────────────────────────────────────────────────────
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
 HEALTHY=false
@@ -294,7 +293,7 @@ while true; do
   fi
 
   if (( ELAPSED % 30 == 0 && ELAPSED > 0 )); then
-    echo -e "\n  ⏳ \${ELAPSED}с — /health: \${HEALTH_RESPONSE:-нет ответа}"
+    echo -e "\n  \u23f3 \${ELAPSED}\u0441 — /health: \${HEALTH_RESPONSE:-нет ответа}"
   else
     printf "."
   fi
@@ -309,7 +308,7 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Проверка доступности MCP-серверов через TCP ────────────────────────────────
+# ── Проверка доступности MCP-серверов через TCP ──────────────────────────────────────────────────────────────
 MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
 log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
@@ -341,13 +340,22 @@ done
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера ────────────────────────────────────────────────────
+# ── Запуск init-контейнера ────────────────────────────────────────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
 docker rm -f open-webui-init 2>/dev/null || true
-if eval "\${DC_CMD} run --rm --name open-webui-init open-webui-init"; then
+# Без --rm: контейнер остаётся после завершения, логи доступны через docker logs open-webui-init
+INIT_EXIT=0
+eval "\${DC_CMD} run --name open-webui-init open-webui-init" || INIT_EXIT=\$?
+
+echo ""
+echo "═════ ЛОГИ init-контейнера ═════"
+docker logs open-webui-init 2>&1 || true
+echo "═══════════════════════════"
+
+if [[ "\${INIT_EXIT}" == "0" ]]; then
   ok "Init-контейнер завершился успешно"
 else
-  warn "Init-контейнер завершился с ошибкой (см. логи выше)"
+  warn "Init-контейнер завершился с ошибкой (exit code: \${INIT_EXIT})"
 fi
 
 echo ""
