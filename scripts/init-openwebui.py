@@ -5,7 +5,7 @@ init-openwebui.py — запускается один раз при старте
 Что делает:
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
-3. Создаёт/обновляет Pipe Function со всеми моделями
+3. Создаёт/обновляет Pipe Function — модели грузятся динамически через GET /openai/models
 4. Подключает MCP Tool Servers (с stub info чтобы configs.py:205 не падал)
 5. Патчит БД если MCP info всё ещё null (tools.py:118 защита)
 """
@@ -55,8 +55,8 @@ PIPE_FUNCTION_CODE = '''
 """
 title: CBR Models
 author: local
-version: 2.0
-description: Все модели chat.ehd-zr.cbr.ru через единый SSL-совместимый Pipe.
+version: 3.0
+description: Динамический список моделей с chat.ehd-zr.cbr.ru через SSL-совместимый Pipe.
 """
 
 import httpx
@@ -65,16 +65,7 @@ import json
 
 UPSTREAM_BASE = "https://chat.ehd-zr.cbr.ru/openai"
 API_KEY = "sk-09fd660cdc8640ac861fe85a16d2d2f1"
-
-# Полный список моделей с сервера
-MODELS = [
-    {"id": "dbra-rag-qwen3-32b-awq",              "name": "DBRA RAG Qwen3 32B"},
-    {"id": "qwen3-vl-2b-instruct",                 "name": "Qwen3 VL 2B"},
-    {"id": "Qwen/Qwen3.6-27B-FP8",                "name": "Qwen3.6 27B FP8"},
-    {"id": "cyankiwi/MiniMax-M2.7-AWQ-4bit",      "name": "MiniMax M2.7 AWQ"},
-    {"id": "Qwen/Qwen3.5-4B",                     "name": "Qwen3.5 4B"},
-    {"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4",   "name": "Qwen3.5 397B (main)"},
-]
+MODELS_CACHE = []
 
 
 def get_ssl_context():
@@ -86,6 +77,28 @@ def get_ssl_context():
     return ctx
 
 
+def fetch_models():
+    """Запрашивает список моделей напрямую у upstream (с SSL-патчем)."""
+    global MODELS_CACHE
+    try:
+        ssl_ctx = get_ssl_context()
+        with httpx.Client(verify=ssl_ctx, timeout=30.0) as client:
+            r = client.get(
+                f"{UPSTREAM_BASE}/models",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+            )
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            MODELS_CACHE = [{"id": m["id"], "name": m.get("name", m["id"])} for m in data]
+    except Exception as e:
+        # Если upstream недоступен — возвращаем кеш или пустой список
+        if not MODELS_CACHE:
+            MODELS_CACHE = [
+                {"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4", "name": "Qwen3.5 397B (fallback)"},
+            ]
+    return MODELS_CACHE
+
+
 class Pipe:
     def __init__(self):
         self.id = "cbr_models"
@@ -93,10 +106,12 @@ class Pipe:
         self.type = "manifold"
 
     def pipes(self):
-        return [{"id": m["id"], "name": m["name"]} for m in MODELS]
+        """Вызывается Open WebUI при загрузке — загружает актуальный список моделей."""
+        models = fetch_models()
+        return [{"id": m["id"], "name": m["name"]} for m in models]
 
     def _resolve_model_id(self, body: dict) -> str:
-        """Open WebUI передаёт model как \"cbr_models.{model_id}\" — извлекаем оригинал."""
+        """Open WebUI передаёт model как "cbr_models.{model_id}" — извлекаем оригинал."""
         raw = body.get("model", "")
         prefix = f"{self.id}."
         if raw.startswith(prefix):
@@ -222,17 +237,17 @@ def get_token():
 def upsert_pipe_function(token):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     # Удаляем старый qwen_cbr если есть
-    old_id = "qwen_cbr"
-    r = requests.get(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
-    if r.status_code == 200:
-        requests.delete(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
-        print(f"[OK] Removed old pipe function: {old_id}")
+    for old_id in ("qwen_cbr",):
+        r = requests.get(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            requests.delete(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
+            print(f"[OK] Removed old pipe function: {old_id}")
 
     payload = {
         "id": PIPE_FUNCTION_ID,
         "name": PIPE_FUNCTION_NAME,
         "content": PIPE_FUNCTION_CODE,
-        "meta": {"description": "All CBR models via SSL-compatible Pipe"},
+        "meta": {"description": "Dynamic CBR models via SSL-compatible Pipe"},
     }
     r = requests.get(f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
     if r.status_code == 200:
