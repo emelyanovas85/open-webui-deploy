@@ -9,45 +9,44 @@ services:
       - "8087:8080"
     volumes:
       - ./scripts:/app/scripts:ro
-      # Переписываем системный openssl.cnf — чтобы aiohttp/ssl использовал SECLEVEL=0
-      # (OPENSSL_CONF игнорируется aiohttp, но /etc/ssl/openssl.cnf читается всегда)
       - ./openssl-legacy.cnf:/etc/ssl/openssl.cnf:ro
-      # Нет персистентного волюма — база чистая при каждом деплое.
     environment:
-      # ── LLM Provider (OpenAI-compatible API) ────────────────────────────────────
+      # ── LLM Provider ───────────────────────────────────────────────────
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
 
-      # ── Ollama (отключён, используем внешний LLM) ──────────────────────
+      # ── Ollama (отключён) ─────────────────────────────────────────────
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
 
-      # ── Security ──────────────────────────────────────────────────────
+      # ── Security ───────────────────────────────────────────────────
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-changeme-super-secret-key}
       - WEBUI_AUTH=${WEBUI_AUTH:-true}
 
-      # ── Автосоздание администратора при первом запуске ─────────────────
+      # ── Админ ──────────────────────────────────────────────────────
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
       - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME:-Admin}
 
-      # ── Общие настройки ──────────────────────────────────────────────
+      # ── Общие настройки ─────────────────────────────────────────────
       - WEBUI_NAME=${WEBUI_NAME:-Open WebUI}
       - DEFAULT_MODELS=${DEFAULT_MODELS:-}
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # ── RAG / Embeddings (отключаем загрузку с HuggingFace — сервер без интернета) ───
+      # ── RAG ───────────────────────────────────────────────────────
       - RAG_EMBEDDING_ENGINE=${RAG_EMBEDDING_ENGINE:-openai}
       - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-text-embedding-3-small}
       - ENABLE_RAG_WEB_SEARCH=${ENABLE_RAG_WEB_SEARCH:-false}
 
-      # ── SSL ───────────────────────────────────────────────────────
+      # ── SSL: sitecustomize.py патчит ssl.create_default_context через PYTHONPATH ────
+      # aiohttp игнорирует OPENSSL_CONF, но читает sitecustomize.py при старте
+      - PYTHONPATH=/app/scripts
       - OPENSSL_CONF=/etc/ssl/openssl.cnf
       - REQUESTS_CA_BUNDLE=
       - CURL_CA_BUNDLE=
       - PYTHONHTTPSVERIFY=0
 
-      # ── Прокси: явно сбрасываем системный прокси ─────────────────────
+      # ── Прокси ───────────────────────────────────────────────────────
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - http_proxy=
@@ -58,7 +57,7 @@ services:
       # ── MCP ───────────────────────────────────────────────────────────
       - MCP_INITIALIZE_TIMEOUT=${MCP_INITIALIZE_TIMEOUT:-30}
 
-      # ── Webhook ───────────────────────────────────────────────────────
+      # ── Webhook ──────────────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
     networks:
