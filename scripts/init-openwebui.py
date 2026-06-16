@@ -4,39 +4,31 @@ init-openwebui.py — запускается один раз при старте
 
 Что делает:
 1. Ждёт пока Open WebUI поднимется
-2. Получает JWT-токен администратора (логин или создание)
-3. Создаёт/обновляет Pipe Function с SSL-обходом и streaming
-4. Подключает MCP Tool Servers — поддерживает несколько через MCP_SERVER_URLS
-
-API Open WebUI v0.8.10:
-  - Создание функции:  POST /api/v1/functions/create
-  - Обновление функции: POST /api/v1/functions/id/{id}/update
-  - Получить MCP-сервера:  GET  /api/v1/configs/tool_servers
-  - Записать MCP-сервера:  POST /api/v1/configs/tool_servers
-    body: {"TOOL_SERVER_CONNECTIONS": [{"url": ..., "type": "mcp", ...}]}
+2. Получает JWT-токен администратора
+3. Создаёт/обновляет Pipe Function
+4. Подключает MCP Tool Servers
+5. Ждёт пока MCP info заполнится (info != null), иначе tools.py:118 падает с AttributeError
 """
 
 import os
 import sys
 import time
 import json
+import sqlite3
 import requests
 
 BASE_URL = os.environ.get("WEBUI_BASE_URL", "http://open-webui:8080").rstrip("/")
 ADMIN_EMAIL = os.environ.get("WEBUI_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.environ.get("WEBUI_ADMIN_PASSWORD", "")
 
-# Поддержка нескольких MCP серверов через MCP_SERVER_URLS
-# Формат: url1::name1::desc1,url2::name2::desc2
-# Или старый формат: просто URL (обратная совместимость через MCP_SERVER_URL)
 MCP_SERVER_URLS_RAW = os.environ.get("MCP_SERVER_URLS", "")
 MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
 
+DB_PATH = "/app/backend/data/webui.db"
+
 
 def parse_mcp_servers():
-    """Парсим список MCP серверов из переменных окружения."""
     servers = []
-
     if MCP_SERVER_URLS_RAW:
         for entry in MCP_SERVER_URLS_RAW.split(","):
             entry = entry.strip()
@@ -53,7 +45,6 @@ def parse_mcp_servers():
             "name": "mcp_server",
             "description": "MCP Tool Server",
         })
-
     return servers
 
 
@@ -157,7 +148,6 @@ class Pipe:
 
 
 def wait_for_webui(max_retries=30, delay=5):
-    """Ждём пока Open WebUI станет доступен."""
     for i in range(max_retries):
         try:
             r = requests.get(f"{BASE_URL}/health", timeout=5)
@@ -173,7 +163,6 @@ def wait_for_webui(max_retries=30, delay=5):
 
 
 def get_token():
-    """Получаем JWT-токен администратора."""
     r = requests.post(
         f"{BASE_URL}/api/v1/auths/signin",
         json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
@@ -204,14 +193,7 @@ def get_token():
 
 
 def upsert_pipe_function(token):
-    """Создаём или обновляем Pipe Function.
-
-    Open WebUI v0.8.10 (backend/open_webui/routers/functions.py):
-      - создание:   POST /api/v1/functions/create
-      - обновление: POST /api/v1/functions/id/{id}/update
-    """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
     r = requests.get(f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
     payload = {
         "id": PIPE_FUNCTION_ID,
@@ -219,9 +201,7 @@ def upsert_pipe_function(token):
         "content": PIPE_FUNCTION_CODE,
         "meta": {"description": "Qwen3.5 CBR via internal SSL"},
     }
-
     if r.status_code == 200:
-        # POST /api/v1/functions/id/{id}/update — v0.8.10
         r = requests.post(
             f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}/update",
             headers=headers, json=payload, timeout=10,
@@ -233,37 +213,18 @@ def upsert_pipe_function(token):
             headers=headers, json=payload, timeout=10,
         )
         print(f"[OK] Pipe function created: {r.status_code}")
-
     if r.status_code not in (200, 201):
         print(f"[WARN] Pipe function response: {r.text[:300]}")
 
 
 def add_mcp_tool_servers(token):
-    """Добавляем MCP сервера через /api/v1/configs/tool_servers.
-
-    Open WebUI v0.8.10 (backend/open_webui/routers/configs.py):
-      - GET  /api/v1/configs/tool_servers  → {"TOOL_SERVER_CONNECTIONS": [...]}
-      - POST /api/v1/configs/tool_servers  → {"TOOL_SERVER_CONNECTIONS": [...]}
-
-    Формат записи:
-      {
-        "url": "http://host:port/sse",
-        "path": "/sse",
-        "type": "mcp",
-        "auth_type": "none",
-        "key": "",
-        "headers": null,
-        "config": {"enable": true}
-      }
-    """
     servers = parse_mcp_servers()
     if not servers:
-        print("[SKIP] No MCP servers configured (MCP_SERVER_URLS not set), skipping")
+        print("[SKIP] No MCP servers configured")
         return
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Получаем текущий список подключений
     r = requests.get(f"{BASE_URL}/api/v1/configs/tool_servers", headers=headers, timeout=10)
     if r.status_code != 200:
         print(f"[WARN] GET /configs/tool_servers returned {r.status_code}: {r.text[:200]}")
@@ -275,15 +236,12 @@ def add_mcp_tool_servers(token):
             print(f"[WARN] Could not parse /configs/tool_servers: {e}")
             existing_connections = []
 
-    # Индекс существующих URL для быстрой проверки
     existing_urls = {c.get("url", "") for c in existing_connections}
-
-    new_connections = list(existing_connections)  # не трогаем уже подключённые
+    new_connections = list(existing_connections)
     added = []
 
     for srv in servers:
         url = srv["url"]
-        # Извлекаем path из URL (напр.: /sse)
         try:
             from urllib.parse import urlparse
             path = urlparse(url).path or "/sse"
@@ -307,20 +265,77 @@ def add_mcp_tool_servers(token):
 
     if not added:
         print("[OK] All MCP servers already registered")
-        return
-
-    # Сохраняем полный список обратно
-    r = requests.post(
-        f"{BASE_URL}/api/v1/configs/tool_servers",
-        headers=headers,
-        json={"TOOL_SERVER_CONNECTIONS": new_connections},
-        timeout=15,
-    )
-    if r.status_code in (200, 201):
-        for url in added:
-            print(f"[OK] MCP server added: {url}")
     else:
-        print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
+        r = requests.post(
+            f"{BASE_URL}/api/v1/configs/tool_servers",
+            headers=headers,
+            json={"TOOL_SERVER_CONNECTIONS": new_connections},
+            timeout=15,
+        )
+        if r.status_code in (200, 201):
+            for url in added:
+                print(f"[OK] MCP server added: {url}")
+        else:
+            print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
+
+
+def wait_for_mcp_info_and_patch(max_retries=24, delay=5):
+    """
+    v0.9.6 баг: tools.py:118 падает с AttributeError если server['info'] == None.
+    Open WebUI должен сам заполнить info после MCP initialize handshake.
+    Ждём до 2 минут, если не заполнился — патчим вручную через SQLite.
+    """
+    print("[..] Waiting for MCP info to be populated...")
+    for i in range(max_retries):
+        time.sleep(delay)
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT data FROM config ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            conn.close()
+            if not row:
+                continue
+            data = json.loads(row[0])
+            connections = data.get("tool_server", {}).get("connections", [])
+            null_count = sum(1 for c in connections if c.get("info") is None)
+            total = len(connections)
+            print(f"[..] MCP info status: {total - null_count}/{total} populated ({i+1}/{max_retries})")
+            if null_count == 0 and total > 0:
+                print("[OK] All MCP servers have info populated")
+                return True
+        except Exception as e:
+            print(f"[WARN] DB check error: {e}")
+
+    # Таймаут — патчим null вручную
+    print("[WARN] MCP info still null after timeout, patching DB directly...")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if row:
+            config_id, raw = row
+            data = json.loads(raw)
+            connections = data.get("tool_server", {}).get("connections", [])
+            patched = False
+            for c in connections:
+                if c.get("info") is None:
+                    # Проставляем минимальный info чтобы tools.py не падал
+                    c["info"] = {"id": c["url"], "name": "mcp", "version": "0.1.0"}
+                    patched = True
+                    print(f"[PATCH] Set stub info for {c['url']}")
+            if patched:
+                cur.execute(
+                    "UPDATE config SET data = ? WHERE id = ?",
+                    (json.dumps(data), config_id)
+                )
+                conn.commit()
+                print("[OK] DB patched successfully")
+        conn.close()
+    except Exception as e:
+        print(f"[ERROR] DB patch failed: {e}")
+    return False
 
 
 def main():
@@ -337,6 +352,7 @@ def main():
 
     upsert_pipe_function(token)
     add_mcp_tool_servers(token)
+    wait_for_mcp_info_and_patch()
     print("[DONE] Init completed successfully")
 
 
