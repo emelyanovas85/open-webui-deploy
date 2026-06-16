@@ -5,10 +5,9 @@ init-openwebui.py — запускается один раз при старте
 Что делает:
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
-3. Отключает дефолтный OpenAI connection (чтобы не было Connection error на api.openai.com)
-4. Создаёт/обновляет Pipe Function — модели грузятся динамически через GET /openai/models
-5. Подключает MCP Tool Servers (с stub info чтобы configs.py:205 не падал)
-6. Патчит БД если MCP info всё ещё null (tools.py:118 защита)
+3. Создаёт/обновляет Pipe Function — модели грузятся динамически
+4. Подключает MCP Tool Servers
+5. Патчит БД: отключает OpenAI connections, фиксит null info
 """
 
 import os
@@ -79,7 +78,6 @@ def get_ssl_context():
 
 
 def fetch_models():
-    """Запрашивает список моделей напрямую у upstream (с SSL-патчем)."""
     global MODELS_CACHE
     try:
         ssl_ctx = get_ssl_context()
@@ -91,7 +89,7 @@ def fetch_models():
             r.raise_for_status()
             data = r.json().get("data", [])
             MODELS_CACHE = [{"id": m["id"], "name": m.get("name", m["id"])} for m in data]
-    except Exception as e:
+    except Exception:
         if not MODELS_CACHE:
             MODELS_CACHE = [
                 {"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4", "name": "Qwen3.5 397B (fallback)"},
@@ -106,12 +104,10 @@ class Pipe:
         self.type = "manifold"
 
     def pipes(self):
-        """Вызывается Open WebUI при загрузке — загружает актуальный список моделей."""
         models = fetch_models()
         return [{"id": m["id"], "name": m["name"]} for m in models]
 
     def _resolve_model_id(self, body: dict) -> str:
-        """Open WebUI передаёт model как "cbr_models.{model_id}" — извлекаем оригинал."""
         raw = body.get("model", "")
         prefix = f"{self.id}."
         if raw.startswith(prefix):
@@ -234,51 +230,8 @@ def get_token():
     return None
 
 
-def disable_openai_connection(token):
-    """
-    Отключает дефолтный OpenAI connection.
-    Open WebUI при первом старте записывает в БД дефолтный endpoint https://api.openai.com/v1,
-    даже если OPENAI_API_BASE_URL='' в .env.
-    Нужно явно выставить enabled=false через API.
-    """
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    # Получаем текущие connections
-    r = requests.get(f"{BASE_URL}/api/v1/configs/openai", headers=headers, timeout=10)
-    if r.status_code != 200:
-        print(f"[WARN] GET /configs/openai returned {r.status_code} — skipping")
-        return
-
-    try:
-        data = r.json()
-    except Exception as e:
-        print(f"[WARN] Could not parse /configs/openai: {e}")
-        return
-
-    connections = data.get("OPENAI_API_CONNECTIONS", [])
-    if not connections:
-        print("[OK] No OpenAI connections found — nothing to disable")
-        return
-
-    # Отключаем все connections
-    for conn in connections:
-        conn["enabled"] = False
-
-    r = requests.post(
-        f"{BASE_URL}/api/v1/configs/openai",
-        headers=headers,
-        json={"OPENAI_API_CONNECTIONS": connections},
-        timeout=10,
-    )
-    if r.status_code in (200, 201):
-        print(f"[OK] OpenAI connections disabled ({len(connections)} connection(s))")
-    else:
-        print(f"[WARN] POST /configs/openai {r.status_code}: {r.text[:300]}")
-
-
 def upsert_pipe_function(token):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    # Удаляем старый qwen_cbr если есть
     for old_id in ("qwen_cbr",):
         r = requests.get(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -382,24 +335,48 @@ def add_mcp_tool_servers(token):
         print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
 
 
-def patch_db_null_info():
+def patch_db(db_path):
+    """
+    Патчит БД напрямую:
+    1. Отключает все OpenAI connections (если есть) — enabled=False
+    2. Фиксит null info у MCP connections
+    """
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1")
         row = cur.fetchone()
         if not row:
+            print("[WARN] DB: config table is empty")
             conn.close()
             return
         config_id, raw = row
         data = json.loads(raw)
-        connections = data.get("tool_server", {}).get("connections", [])
+
         patched = False
-        for c in connections:
-            if c.get("info") is None:
-                c["info"] = make_stub_info(c.get("url", ""))
+
+        # 1. Отключаем OpenAI connections
+        # Структура в БД v0.9.x: data["openai"]["connections"] = [{"url":..., "key":..., "enabled":True}, ...]
+        openai_connections = data.get("openai", {}).get("connections", [])
+        disabled_count = 0
+        for c in openai_connections:
+            if c.get("enabled", True):
+                c["enabled"] = False
+                disabled_count += 1
                 patched = True
-                print(f"[PATCH] Set stub info for {c['url']}")
+        if disabled_count:
+            print(f"[PATCH] Disabled {disabled_count} OpenAI connection(s) in DB")
+        else:
+            print("[OK] DB: no active OpenAI connections found")
+
+        # 2. Фиксит null info у MCP connections
+        mcp_connections = data.get("tool_server", {}).get("connections", [])
+        for c in mcp_connections:
+            if c.get("info") is None:
+                c["info"] = {"id": c.get("url", ""), "name": "mcp", "version": "0.1.0"}
+                patched = True
+                print(f"[PATCH] Set stub info for MCP {c.get('url', '')}")
+
         if patched:
             cur.execute(
                 "UPDATE config SET data = ? WHERE id = ?",
@@ -408,7 +385,13 @@ def patch_db_null_info():
             conn.commit()
             print("[OK] DB patched successfully")
         else:
-            print("[OK] DB check passed — no null info found")
+            print("[OK] DB check passed — nothing to patch")
+
+        # Показываем итоговое состояние для отладки
+        print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
+              f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
+        print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
+
         conn.close()
     except Exception as e:
         print(f"[ERROR] DB patch failed: {e}")
@@ -426,11 +409,13 @@ def main():
     if not token:
         sys.exit(1)
 
-    disable_openai_connection(token)
     upsert_pipe_function(token)
     add_mcp_tool_servers(token)
-    time.sleep(3)
-    patch_db_null_info()
+
+    # Ждём пока Open WebUI запишет свои defaults в БД
+    time.sleep(5)
+    patch_db(DB_PATH)
+
     print("[DONE] Init completed successfully")
 
 
