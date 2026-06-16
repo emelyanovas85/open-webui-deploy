@@ -9,9 +9,10 @@ services:
       - "8087:8080"
     volumes:
       - ./scripts:/app/scripts:ro
-      - ./openssl-legacy.cnf:/etc/ssl/openssl-legacy.cnf:ro
+      # Переписываем системный openssl.cnf — чтобы aiohttp/ssl использовал SECLEVEL=0
+      # (OPENSSL_CONF игнорируется aiohttp, но /etc/ssl/openssl.cnf читается всегда)
+      - ./openssl-legacy.cnf:/etc/ssl/openssl.cnf:ro
       # Нет персистентного волюма — база чистая при каждом деплое.
-      # Всё настраивается через init-скрипт: аккаунт, Pipe Function, MCP-сервера.
     environment:
       # ── LLM Provider (OpenAI-compatible API) ────────────────────────────────────
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -40,9 +41,8 @@ services:
       - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-text-embedding-3-small}
       - ENABLE_RAG_WEB_SEARCH=${ENABLE_RAG_WEB_SEARCH:-false}
 
-      # ── SSL: понижаем SECLEVEL для совместимости с Bank of Russia TLS ────────────
-      # Сервер использует AES256-GCM-SHA384 без ECDHE — запрещен по умолчанию в Python 3.10+
-      - OPENSSL_CONF=/etc/ssl/openssl-legacy.cnf
+      # ── SSL ───────────────────────────────────────────────────────
+      - OPENSSL_CONF=/etc/ssl/openssl.cnf
       - REQUESTS_CA_BUNDLE=
       - CURL_CA_BUNDLE=
       - PYTHONHTTPSVERIFY=0
@@ -55,18 +55,15 @@ services:
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8}
       - no_proxy=${no_proxy:-localhost,127.0.0.1,10.0.0.0/8}
 
-      # ── MCP: настраиваемый таймаут инициализации (новое в v0.9.6) ─────────
+      # ── MCP ───────────────────────────────────────────────────────────
       - MCP_INITIALIZE_TIMEOUT=${MCP_INITIALIZE_TIMEOUT:-30}
 
-      # ── Webhook integration ─────────────────────────────────────────────
+      # ── Webhook ───────────────────────────────────────────────────────
       - WEBHOOK_GITLAB_SECRET_TOKEN=${WEBHOOK_GITLAB_SECRET_TOKEN:-}
       - WEBHOOK_GITHUB_SECRET_TOKEN=${WEBHOOK_GITHUB_SECRET_TOKEN:-}
     networks:
       - webui-net
 
-  # ── Init-контейнер: запускается вручную из deploy.sh после healthcheck ────
-  # docker-compose v1 не поддерживает depends_on: condition: service_healthy,
-  # поэтому запуск управляется через deploy.sh: docker-compose run --rm open-webui-init
   open-webui-init:
     image: open-webui-init:latest
     container_name: open-webui-init
