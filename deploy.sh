@@ -139,7 +139,7 @@ ok "Базовый образ найден локально"
 
 # ── Сборка патченого образа open-webui-patched локально ─────────────────────────────
 log "Сборка патченого образа ${PATCHED_IMAGE} из Dockerfile..."
-docker build --no-cache -t "${PATCHED_IMAGE}" "${SCRIPT_DIR}" \
+docker build -t "${PATCHED_IMAGE}" "${SCRIPT_DIR}" \
   || error "Не удалось собрать ${PATCHED_IMAGE}"
 LOCAL_PATCHED_ID=$(docker image inspect "${PATCHED_IMAGE}" --format '{{.Id}}')
 ok "Образ ${PATCHED_IMAGE} собран (ID: ${LOCAL_PATCHED_ID:7:12})"
