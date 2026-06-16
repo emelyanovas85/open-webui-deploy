@@ -5,9 +5,10 @@ init-openwebui.py — запускается один раз при старте
 Что делает:
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
-3. Создаёт/обновляет Pipe Function — модели грузятся динамически через GET /openai/models
-4. Подключает MCP Tool Servers (с stub info чтобы configs.py:205 не падал)
-5. Патчит БД если MCP info всё ещё null (tools.py:118 защита)
+3. Отключает дефолтный OpenAI connection (чтобы не было Connection error на api.openai.com)
+4. Создаёт/обновляет Pipe Function — модели грузятся динамически через GET /openai/models
+5. Подключает MCP Tool Servers (с stub info чтобы configs.py:205 не падал)
+6. Патчит БД если MCP info всё ещё null (tools.py:118 защита)
 """
 
 import os
@@ -91,7 +92,6 @@ def fetch_models():
             data = r.json().get("data", [])
             MODELS_CACHE = [{"id": m["id"], "name": m.get("name", m["id"])} for m in data]
     except Exception as e:
-        # Если upstream недоступен — возвращаем кеш или пустой список
         if not MODELS_CACHE:
             MODELS_CACHE = [
                 {"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4", "name": "Qwen3.5 397B (fallback)"},
@@ -232,6 +232,48 @@ def get_token():
 
     print(f"[ERROR] Cannot get token: {r.status_code} {r.text}")
     return None
+
+
+def disable_openai_connection(token):
+    """
+    Отключает дефолтный OpenAI connection.
+    Open WebUI при первом старте записывает в БД дефолтный endpoint https://api.openai.com/v1,
+    даже если OPENAI_API_BASE_URL='' в .env.
+    Нужно явно выставить enabled=false через API.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Получаем текущие connections
+    r = requests.get(f"{BASE_URL}/api/v1/configs/openai", headers=headers, timeout=10)
+    if r.status_code != 200:
+        print(f"[WARN] GET /configs/openai returned {r.status_code} — skipping")
+        return
+
+    try:
+        data = r.json()
+    except Exception as e:
+        print(f"[WARN] Could not parse /configs/openai: {e}")
+        return
+
+    connections = data.get("OPENAI_API_CONNECTIONS", [])
+    if not connections:
+        print("[OK] No OpenAI connections found — nothing to disable")
+        return
+
+    # Отключаем все connections
+    for conn in connections:
+        conn["enabled"] = False
+
+    r = requests.post(
+        f"{BASE_URL}/api/v1/configs/openai",
+        headers=headers,
+        json={"OPENAI_API_CONNECTIONS": connections},
+        timeout=10,
+    )
+    if r.status_code in (200, 201):
+        print(f"[OK] OpenAI connections disabled ({len(connections)} connection(s))")
+    else:
+        print(f"[WARN] POST /configs/openai {r.status_code}: {r.text[:300]}")
 
 
 def upsert_pipe_function(token):
@@ -384,6 +426,7 @@ def main():
     if not token:
         sys.exit(1)
 
+    disable_openai_connection(token)
     upsert_pipe_function(token)
     add_mcp_tool_servers(token)
     time.sleep(3)
