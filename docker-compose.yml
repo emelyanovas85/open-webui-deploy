@@ -84,7 +84,6 @@ services:
       - MCP_SERVER_URLS=${MCP_SERVER_URLS:-}
       - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
       - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
-    command: python /app/scripts/init-openwebui.py
     networks:
       - webui-net
 
