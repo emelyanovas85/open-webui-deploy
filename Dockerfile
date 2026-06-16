@@ -1,79 +1,70 @@
-# Патч к ghcr.io/open-webui/open-webui:
-# Исправляет UnboundLocalError: 'server_id' not associated with a value
-# в backend/open_webui/utils/tools.py при подключении MCP инструментов.
-#
-# Причина бага: если tool_id разбивается на != 2 и != 3 части (например
-# server:mcp:host:port), ни одна ветка if/elif не выполняется, и server_id
-# остаётся необъявленной, что вызывает UnboundLocalError при следующем
-# обращении к переменной.
-#
-# Исправление: добавляем инициализацию server_id = None перед блоком if/elif
-# и guard-check после него, чтобы пропустить некорректный tool_id без краша.
-
 FROM ghcr.io/open-webui/open-webui:v0.9.6
 
-# Применяем патч через Python с regex — не зависит от количества пробелов
+# Патч: исправляет UnboundLocalError 'server_id' в tools.py
+# Между `splits = tool_id.split(':')` и `if len(splits) == 2:` есть пустая строка,
+# поэтому используем построчный подход вместо regex по всему блоку.
 RUN python3 - <<'PYEOF'
-import re
-
 path = "/app/backend/open_webui/utils/tools.py"
 
 with open(path, "r", encoding="utf-8") as f:
-    src = f.read()
+    lines = f.readlines()
 
-# Already patched?
-if "server_id = None  # patched" in src:
-    print("[PATCH] tools.py already patched, skipping")
+if any("server_id = None  # patched" in l for l in lines):
+    print("[PATCH] already patched, skipping")
     exit(0)
 
-# Strategy: find the block
-#     splits = tool_id.split(':')
-#     if len(splits) == 2:
-#         ...
-#         server_id = splits[1]
-#     elif len(splits) == 3:
-#         ...
-#         server_id = splits[2]
-#
-# and insert:
-#   1. server_id = None  # patched   — before the if block
-#   2. else: continue                — after the elif block, before the next statement
+out = []
+i = 0
+patched1 = 0
+patched2 = 0
 
-# Step 1: insert `server_id = None` before `if len(splits) == 2:`
-pattern1 = r'([ \t]*)(splits\s*=\s*tool_id\.split\([\'\"]:[\'"]\)\n)([ \t]*if len\(splits\) == 2:)'
-replacement1 = r'\1\2\1server_id = None  # patched\n\3'
-src2, n1 = re.subn(pattern1, replacement1, src)
-if n1 == 0:
-    print("[WARN] Step 1 pattern not found in tools.py — code may have changed upstream")
-    print("       Trying fallback…")
+while i < len(lines):
+    line = lines[i]
+
+    # Step 1: вставляем `server_id = None` перед `if len(splits) == 2:`
+    # (после строки со splits = tool_id.split(':'), возможно через пустую строку)
+    stripped = line.rstrip()
+    if "if len(splits) == 2:" in stripped and patched1 == 0:
+        indent = len(line) - len(line.lstrip())
+        prefix = " " * indent
+        out.append(prefix + "server_id = None  # patched\n")
+        patched1 += 1
+
+    # Step 2: вставляем `else: continue` после блока elif len(splits) == 3:
+    # Ищем конец elif-блока: две строки с присваиваниями после elif
+    if "elif len(splits) == 3:" in stripped and patched2 == 0:
+        out.append(line)
+        i += 1
+        # следующие 2 строки — тело elif
+        for _ in range(2):
+            if i < len(lines):
+                out.append(lines[i])
+                i += 1
+        indent = len(line) - len(line.lstrip())
+        prefix = " " * indent
+        out.append(prefix + "else:\n")
+        out.append(prefix + "    continue  # unexpected tool_id format\n")
+        patched2 += 1
+        continue
+
+    out.append(line)
+    i += 1
+
+if patched1 == 0:
+    print("[WARN] Step 1 not applied — 'if len(splits) == 2:' not found")
 else:
-    print(f"[PATCH] Step 1 applied ({n1} replacement)")
+    print(f"[PATCH] Step 1 applied — server_id = None inserted")
 
-# Step 2: insert `else: continue` after the elif block, before `server_id_splits =`
-# Match the elif block end and the next statement
-pattern2 = r'([ \t]*elif len\(splits\) == 3:\n[ \t]+\S[^\n]*\n[ \t]+\S[^\n]*\n)(\n?)([ \t]*server_id_splits\s*=)'
-def add_else(m):
-    indent = re.match(r'([ \t]*)', m.group(3)).group(1)
-    return (
-        m.group(1)
-        + f"{indent}else:\n"
-        + f"{indent}    # tool_id has unexpected number of parts — skip to avoid UnboundLocalError\n"
-        + f"{indent}    continue\n"
-        + m.group(2)
-        + m.group(3)
-    )
-
-src3, n2 = re.subn(pattern2, add_else, src2)
-if n2 == 0:
-    print("[WARN] Step 2 pattern not found in tools.py — code may have changed upstream")
+if patched2 == 0:
+    print("[WARN] Step 2 not applied — 'elif len(splits) == 3:' not found")
 else:
-    print(f"[PATCH] Step 2 applied ({n2} replacement)")
+    print(f"[PATCH] Step 2 applied — else: continue inserted")
 
-if n1 > 0 or n2 > 0:
+if patched1 > 0 or patched2 > 0:
     with open(path, "w", encoding="utf-8") as f:
-        f.write(src3)
+        f.writelines(out)
     print("[PATCH] tools.py written successfully")
 else:
-    print("[ERROR] No patches applied — please check tools.py manually")
+    print("[ERROR] No patches applied")
     exit(1)
 PYEOF
