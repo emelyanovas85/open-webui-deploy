@@ -5,7 +5,7 @@ init-openwebui.py — запускается один раз при старте
 Что делает:
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
-3. Создаёт/обновляет Pipe Function
+3. Создаёт/обновляет Pipe Function со всеми моделями
 4. Подключает MCP Tool Servers (с stub info чтобы configs.py:205 не падал)
 5. Патчит БД если MCP info всё ещё null (tools.py:118 защита)
 """
@@ -48,23 +48,33 @@ def parse_mcp_servers():
     return servers
 
 
-PIPE_FUNCTION_ID = "qwen_cbr"
-PIPE_FUNCTION_NAME = "Qwen3.5 CBR"
+PIPE_FUNCTION_ID = "cbr_models"
+PIPE_FUNCTION_NAME = "CBR Models"
 
 PIPE_FUNCTION_CODE = '''
 """
-title: Qwen3_5_CBR
+title: CBR Models
 author: local
-version: 1.2
+version: 2.0
+description: Все модели chat.ehd-zr.cbr.ru через единый SSL-совместимый Pipe.
 """
 
 import httpx
 import ssl
 import json
 
-UPSTREAM_URL = "https://chat.ehd-zr.cbr.ru/openai/chat/completions"
-MODEL_ID = "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4"
+UPSTREAM_BASE = "https://chat.ehd-zr.cbr.ru/openai"
 API_KEY = "sk-09fd660cdc8640ac861fe85a16d2d2f1"
+
+# Полный список моделей с сервера
+MODELS = [
+    {"id": "dbra-rag-qwen3-32b-awq",              "name": "DBRA RAG Qwen3 32B"},
+    {"id": "qwen3-vl-2b-instruct",                 "name": "Qwen3 VL 2B"},
+    {"id": "Qwen/Qwen3.6-27B-FP8",                "name": "Qwen3.6 27B FP8"},
+    {"id": "cyankiwi/MiniMax-M2.7-AWQ-4bit",      "name": "MiniMax M2.7 AWQ"},
+    {"id": "Qwen/Qwen3.5-4B",                     "name": "Qwen3.5 4B"},
+    {"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4",   "name": "Qwen3.5 397B (main)"},
+]
 
 
 def get_ssl_context():
@@ -78,16 +88,24 @@ def get_ssl_context():
 
 class Pipe:
     def __init__(self):
-        self.id = "qwen_cbr"
-        self.name = "Qwen3.5 CBR"
+        self.id = "cbr_models"
+        self.name = "CBR Models"
         self.type = "manifold"
 
     def pipes(self):
-        return [{"id": "qwen_cbr", "name": "Qwen3.5 CBR"}]
+        return [{"id": m["id"], "name": m["name"]} for m in MODELS]
 
-    def _build_payload(self, body: dict):
+    def _resolve_model_id(self, body: dict) -> str:
+        """Open WebUI передаёт model как \"cbr_models.{model_id}\" — извлекаем оригинал."""
+        raw = body.get("model", "")
+        prefix = f"{self.id}."
+        if raw.startswith(prefix):
+            return raw[len(prefix):]
+        return raw
+
+    def _build_payload(self, body: dict) -> dict:
         payload = {
-            "model": MODEL_ID,
+            "model": self._resolve_model_id(body),
             "messages": body.get("messages", []),
         }
         for key in ("temperature", "max_tokens", "top_p",
@@ -106,7 +124,12 @@ class Pipe:
         }
         ssl_ctx = get_ssl_context()
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-            with client.stream("POST", UPSTREAM_URL, headers=headers, json=payload) as r:
+            with client.stream(
+                "POST",
+                f"{UPSTREAM_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as r:
                 r.raise_for_status()
                 for line in r.iter_lines():
                     if not line:
@@ -140,7 +163,11 @@ class Pipe:
         }
         ssl_ctx = get_ssl_context()
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-            r = client.post(UPSTREAM_URL, headers=headers, json=payload)
+            r = client.post(
+                f"{UPSTREAM_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
             r.raise_for_status()
             result = r.json()
             return result["choices"][0]["message"]["content"]
@@ -194,13 +221,20 @@ def get_token():
 
 def upsert_pipe_function(token):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    r = requests.get(f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
+    # Удаляем старый qwen_cbr если есть
+    old_id = "qwen_cbr"
+    r = requests.get(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
+    if r.status_code == 200:
+        requests.delete(f"{BASE_URL}/api/v1/functions/id/{old_id}", headers=headers, timeout=10)
+        print(f"[OK] Removed old pipe function: {old_id}")
+
     payload = {
         "id": PIPE_FUNCTION_ID,
         "name": PIPE_FUNCTION_NAME,
         "content": PIPE_FUNCTION_CODE,
-        "meta": {"description": "Qwen3.5 CBR via internal SSL"},
+        "meta": {"description": "All CBR models via SSL-compatible Pipe"},
     }
+    r = requests.get(f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}", headers=headers, timeout=10)
     if r.status_code == 200:
         r = requests.post(
             f"{BASE_URL}/api/v1/functions/id/{PIPE_FUNCTION_ID}/update",
@@ -218,9 +252,6 @@ def upsert_pipe_function(token):
 
 
 def make_stub_info(url):
-    """v0.9.6: configs.py:205 делает connection.get('info', {}).get('id') —
-    падает если info=None (ключ есть, значение None, дефолт {} не применяется).
-    Передаём stub сразу при регистрации."""
     return {"id": url, "name": "mcp", "version": "0.1.0"}
 
 
@@ -243,7 +274,6 @@ def add_mcp_tool_servers(token):
             print(f"[WARN] Could not parse /configs/tool_servers: {e}")
             existing_connections = []
 
-    # Патчим существующие соединения с info=None на stub
     for c in existing_connections:
         if c.get("info") is None:
             c["info"] = make_stub_info(c.get("url", ""))
@@ -272,7 +302,7 @@ def add_mcp_tool_servers(token):
             "key": "",
             "headers": None,
             "config": {"enable": True},
-            "info": make_stub_info(url),  # stub чтобы configs.py:205 не падал
+            "info": make_stub_info(url),
         })
         added.append(url)
 
@@ -296,7 +326,6 @@ def add_mcp_tool_servers(token):
 
 
 def patch_db_null_info():
-    """Финальная защита: если после API-регистрации в БД всё ещё есть info=null — патчим."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -342,7 +371,6 @@ def main():
 
     upsert_pipe_function(token)
     add_mcp_tool_servers(token)
-    # Небольшая пауза — дать Open WebUI время записать своё состояние после регистрации
     time.sleep(3)
     patch_db_null_info()
     print("[DONE] Init completed successfully")
