@@ -1,6 +1,13 @@
 FROM ghcr.io/open-webui/open-webui:v0.9.6
 
-# Патч: исправляет UnboundLocalError 'server_id' в utils/tools.py
-# Используем COPY + python3 вместо heredoc — heredoc ненадёжно работает в legacy builder
+# Патч 1: исправляет UnboundLocalError 'server_id' в utils/tools.py
+#   при tool_id формата, не равного 2 или 3 частям через ':'
 COPY patches/fix_tools_server_id.py /tmp/fix_tools_server_id.py
 RUN python3 /tmp/fix_tools_server_id.py
+
+# Патч 2: разрешает type='mcp' в get_tool_servers_data (utils/tools.py)
+#   open-webui v0.9.6 фильтрует серверы по type == 'openapi',
+#   MCP-серверы с type='mcp' молча игнорируются → инструменты не загружаются.
+#   Патч меняет условие на: type in ('openapi', 'mcp')
+COPY patches/fix_tools_type_filter.py /tmp/fix_tools_type_filter.py
+RUN python3 /tmp/fix_tools_type_filter.py
