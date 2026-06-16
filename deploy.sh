@@ -128,7 +128,7 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Проверка и передача open-webui образа ───────────────────────────────────────────────
+# ── Проверка и передача open-webui образа ───────────────────────────────────────────
 log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
@@ -182,7 +182,7 @@ if [[ "${NEED_INIT_TRANSFER}" == "true" ]]; then
   ok "Образ ${INIT_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
-# ── Конфигурация ────────────────────────────────────────────────────────────────────────────
+# ── Конфигурация ────────────────────────────────────────────────────────────────────────────────────────
 log "Подготовка конфигурации (ветка: ${GIT_BRANCH})..."
 LOCAL_ARCHIVE="$(mktemp /tmp/open-webui-deploy-XXXXXX.tar.gz)"
 git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHIVE}" \
@@ -254,9 +254,10 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# ── Полная остановка и удаление данных ──────────────────────────────────────────────────────────────────────────────────
+# ── Полная остановка и удаление данных ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 log "Остановка стека и удаление данных (чистый деплой)..."
 eval "\${DC_CMD} down --remove-orphans --volumes" 2>/dev/null || true
+# Удаляем все связанные контейнеры вручную (docker-compose v1 не удаляет run-контейнеры через down)
 docker rm -f open-webui open-webui-init 2>/dev/null || true
 COMPOSE_PROJECT=\$(basename "\${APP_DIR}")
 docker volume rm "\${COMPOSE_PROJECT}_webui-data" 2>/dev/null && ok "Volume webui-data удалён" || true
@@ -267,7 +268,7 @@ log "Запуск open-webui..."
 eval "\${DC_CMD} up -d --no-build open-webui"
 ok "open-webui запущен"
 
-# ── Ждём готовности Open WebUI по /health ────────────────────────────────────────────────────────────────────────
+# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────────────────────────────────────────────────
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
 HEALTHY=false
@@ -308,7 +309,7 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Проверка доступности MCP-серверов через TCP ──────────────────────────────────────────────────────────────
+# ── Проверка доступности MCP-серверов через TCP ─────────────────────────────────────────────────────────────────────────────────────
 MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
 log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
@@ -340,10 +341,11 @@ done
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера ────────────────────────────────────────────────────────────────────────────────────────
+# ── Запуск init-контейнера ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
+# Удаляем контейнер если остался от предыдущего запуска
+# (docker-compose v1 не удаляет run-контейнеры через 'down', поэтому делаем это вручную)
 docker rm -f open-webui-init 2>/dev/null || true
-# Без --rm: контейнер остаётся после завершения, логи доступны через docker logs open-webui-init
 INIT_EXIT=0
 eval "\${DC_CMD} run --name open-webui-init open-webui-init" || INIT_EXIT=\$?
 
