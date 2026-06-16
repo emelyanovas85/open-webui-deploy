@@ -51,6 +51,7 @@ APP_DIR="~/open-webui-deploy"
 APP_PORT="8087"
 COMPOSE_FILE="docker-compose.yml"
 OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.9.6"
+PATCHED_IMAGE="open-webui-patched:v0.9.6"
 INIT_IMAGE="open-webui-init:latest"
 FORCE_IMAGE=false
 HTTPS_PROXY_URL=""
@@ -128,33 +129,37 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Проверка и передача open-webui образа ───────────────────────────────────────────
-log "Проверка Docker-образа ${OPEN_WEBUI_IMAGE} локально..."
+# ── Проверка базового образа open-webui ──────────────────────────────────────────────
+log "Проверка базового образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
   docker_pull "${OPEN_WEBUI_IMAGE}" || error "Не удалось загрузить ${OPEN_WEBUI_IMAGE}."
 fi
-LOCAL_IMAGE_ID=$(docker image inspect "${OPEN_WEBUI_IMAGE}" --format '{{.Id}}')
-ok "Образ найден (ID: ${LOCAL_IMAGE_ID:7:12})"
+ok "Базовый образ найден локально"
 
-NEED_TRANSFER=true
+# ── Сборка патченого образа open-webui-patched локально ────────────────────────────
+log "Сборка патченого образа ${PATCHED_IMAGE} из Dockerfile..."
+docker build --no-cache -t "${PATCHED_IMAGE}" "${SCRIPT_DIR}" \
+  || error "Не удалось собрать ${PATCHED_IMAGE}"
+LOCAL_PATCHED_ID=$(docker image inspect "${PATCHED_IMAGE}" --format '{{.Id}}')
+ok "Образ ${PATCHED_IMAGE} собран (ID: ${LOCAL_PATCHED_ID:7:12})"
+
+NEED_PATCHED_TRANSFER=true
 if [[ "${FORCE_IMAGE}" == "false" ]]; then
-  log "Проверка образа на ${REMOTE_HOST}..."
-  REMOTE_IMAGE_ID=$($SSH_CMD "docker image inspect ${OPEN_WEBUI_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
-  if [[ "${REMOTE_IMAGE_ID}" == "${LOCAL_IMAGE_ID}" ]]; then
-    ok "Образ на сервере актуален (ID совпадает) — передача пропущена"
-    NEED_TRANSFER=false
-  elif [[ "${REMOTE_IMAGE_ID}" == "MISSING" ]]; then
-    log "Образ на сервере отсутствует — будет передан"
+  log "Проверка ${PATCHED_IMAGE} на ${REMOTE_HOST}..."
+  REMOTE_PATCHED_ID=$($SSH_CMD "docker image inspect ${PATCHED_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
+  if [[ "${REMOTE_PATCHED_ID}" == "${LOCAL_PATCHED_ID}" ]]; then
+    ok "Образ ${PATCHED_IMAGE} на сервере актуален — передача пропущена"
+    NEED_PATCHED_TRANSFER=false
   else
-    warn "Образ на сервере устарел (remote: ${REMOTE_IMAGE_ID:7:12}) — будет обновлён"
+    log "Образ ${PATCHED_IMAGE} на сервере отсутствует или устарел — будет передан"
   fi
 fi
 
-if [[ "${NEED_TRANSFER}" == "true" ]]; then
-  log "Передача образа ${OPEN_WEBUI_IMAGE} на ${REMOTE_HOST}..."
-  docker save "${OPEN_WEBUI_IMAGE}" | $SSH_CMD 'docker load'
-  ok "Образ open-webui загружен на ${REMOTE_HOST}"
+if [[ "${NEED_PATCHED_TRANSFER}" == "true" ]]; then
+  log "Передача образа ${PATCHED_IMAGE} на ${REMOTE_HOST}..."
+  docker save "${PATCHED_IMAGE}" | $SSH_CMD 'docker load'
+  ok "Образ ${PATCHED_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
 # ── Сборка и передача open-webui-init образа ──────────────────────────────────────────────
@@ -254,7 +259,7 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# ── Полная остановка и удаление данных ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Полная остановка и удаление данных ──────────────────────────────────────────────
 log "Остановка стека и удаление данных (чистый деплой)..."
 eval "\${DC_CMD} down --remove-orphans --volumes" 2>/dev/null || true
 # Удаляем все связанные контейнеры вручную (docker-compose v1 не удаляет run-контейнеры через down)
@@ -263,12 +268,12 @@ COMPOSE_PROJECT=\$(basename "\${APP_DIR}")
 docker volume rm "\${COMPOSE_PROJECT}_webui-data" 2>/dev/null && ok "Volume webui-data удалён" || true
 ok "Старые данные очищены"
 
-# Запускаем ТОЛЬКО open-webui
+# Запускаем ТОЛЬКО open-webui (образ уже передан локально — сборка не нужна)
 log "Запуск open-webui..."
 eval "\${DC_CMD} up -d --no-build open-webui"
 ok "open-webui запущен"
 
-# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────────────────────────────────────────────────
+# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────────
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
 HEALTHY=false
@@ -309,7 +314,7 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Проверка доступности MCP-серверов через TCP ─────────────────────────────────────────────────────────────────────────────────────
+# ── Проверка доступности MCP-серверов через TCP ──────────────────────────────────
 MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
 log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
@@ -341,10 +346,9 @@ done
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Запуск init-контейнера ────────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
 # Удаляем контейнер если остался от предыдущего запуска
-# (docker-compose v1 не удаляет run-контейнеры через 'down', поэтому делаем это вручную)
 docker rm -f open-webui-init 2>/dev/null || true
 INIT_EXIT=0
 eval "\${DC_CMD} run --name open-webui-init open-webui-init" || INIT_EXIT=\$?
