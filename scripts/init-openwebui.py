@@ -6,8 +6,8 @@ init-openwebui.py — запускается один раз при старте
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
 3. Создаёт/обновляет Pipe Function
-4. Подключает MCP Tool Servers
-5. Ждёт пока MCP info заполнится (info != null), иначе tools.py:118 падает с AttributeError
+4. Подключает MCP Tool Servers (с stub info чтобы configs.py:205 не падал)
+5. Патчит БД если MCP info всё ещё null (tools.py:118 защита)
 """
 
 import os
@@ -217,6 +217,13 @@ def upsert_pipe_function(token):
         print(f"[WARN] Pipe function response: {r.text[:300]}")
 
 
+def make_stub_info(url):
+    """v0.9.6: configs.py:205 делает connection.get('info', {}).get('id') —
+    падает если info=None (ключ есть, значение None, дефолт {} не применяется).
+    Передаём stub сразу при регистрации."""
+    return {"id": url, "name": "mcp", "version": "0.1.0"}
+
+
 def add_mcp_tool_servers(token):
     servers = parse_mcp_servers()
     if not servers:
@@ -235,6 +242,11 @@ def add_mcp_tool_servers(token):
         except Exception as e:
             print(f"[WARN] Could not parse /configs/tool_servers: {e}")
             existing_connections = []
+
+    # Патчим существующие соединения с info=None на stub
+    for c in existing_connections:
+        if c.get("info") is None:
+            c["info"] = make_stub_info(c.get("url", ""))
 
     existing_urls = {c.get("url", "") for c in existing_connections}
     new_connections = list(existing_connections)
@@ -260,82 +272,60 @@ def add_mcp_tool_servers(token):
             "key": "",
             "headers": None,
             "config": {"enable": True},
+            "info": make_stub_info(url),  # stub чтобы configs.py:205 не падал
         })
         added.append(url)
 
-    if not added:
+    if not added and not any(c.get("info") is None for c in existing_connections):
         print("[OK] All MCP servers already registered")
+        return
+
+    r = requests.post(
+        f"{BASE_URL}/api/v1/configs/tool_servers",
+        headers=headers,
+        json={"TOOL_SERVER_CONNECTIONS": new_connections},
+        timeout=15,
+    )
+    if r.status_code in (200, 201):
+        for url in added:
+            print(f"[OK] MCP server added: {url}")
+        if not added:
+            print("[OK] MCP connections updated (stub info patched)")
     else:
-        r = requests.post(
-            f"{BASE_URL}/api/v1/configs/tool_servers",
-            headers=headers,
-            json={"TOOL_SERVER_CONNECTIONS": new_connections},
-            timeout=15,
-        )
-        if r.status_code in (200, 201):
-            for url in added:
-                print(f"[OK] MCP server added: {url}")
-        else:
-            print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
+        print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
 
 
-def wait_for_mcp_info_and_patch(max_retries=24, delay=5):
-    """
-    v0.9.6 баг: tools.py:118 падает с AttributeError если server['info'] == None.
-    Open WebUI должен сам заполнить info после MCP initialize handshake.
-    Ждём до 2 минут, если не заполнился — патчим вручную через SQLite.
-    """
-    print("[..] Waiting for MCP info to be populated...")
-    for i in range(max_retries):
-        time.sleep(delay)
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT data FROM config ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            conn.close()
-            if not row:
-                continue
-            data = json.loads(row[0])
-            connections = data.get("tool_server", {}).get("connections", [])
-            null_count = sum(1 for c in connections if c.get("info") is None)
-            total = len(connections)
-            print(f"[..] MCP info status: {total - null_count}/{total} populated ({i+1}/{max_retries})")
-            if null_count == 0 and total > 0:
-                print("[OK] All MCP servers have info populated")
-                return True
-        except Exception as e:
-            print(f"[WARN] DB check error: {e}")
-
-    # Таймаут — патчим null вручную
-    print("[WARN] MCP info still null after timeout, patching DB directly...")
+def patch_db_null_info():
+    """Финальная защита: если после API-регистрации в БД всё ещё есть info=null — патчим."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1")
         row = cur.fetchone()
-        if row:
-            config_id, raw = row
-            data = json.loads(raw)
-            connections = data.get("tool_server", {}).get("connections", [])
-            patched = False
-            for c in connections:
-                if c.get("info") is None:
-                    # Проставляем минимальный info чтобы tools.py не падал
-                    c["info"] = {"id": c["url"], "name": "mcp", "version": "0.1.0"}
-                    patched = True
-                    print(f"[PATCH] Set stub info for {c['url']}")
-            if patched:
-                cur.execute(
-                    "UPDATE config SET data = ? WHERE id = ?",
-                    (json.dumps(data), config_id)
-                )
-                conn.commit()
-                print("[OK] DB patched successfully")
+        if not row:
+            conn.close()
+            return
+        config_id, raw = row
+        data = json.loads(raw)
+        connections = data.get("tool_server", {}).get("connections", [])
+        patched = False
+        for c in connections:
+            if c.get("info") is None:
+                c["info"] = make_stub_info(c.get("url", ""))
+                patched = True
+                print(f"[PATCH] Set stub info for {c['url']}")
+        if patched:
+            cur.execute(
+                "UPDATE config SET data = ? WHERE id = ?",
+                (json.dumps(data), config_id)
+            )
+            conn.commit()
+            print("[OK] DB patched successfully")
+        else:
+            print("[OK] DB check passed — no null info found")
         conn.close()
     except Exception as e:
         print(f"[ERROR] DB patch failed: {e}")
-    return False
 
 
 def main():
@@ -352,7 +342,9 @@ def main():
 
     upsert_pipe_function(token)
     add_mcp_tool_servers(token)
-    wait_for_mcp_info_and_patch()
+    # Небольшая пауза — дать Open WebUI время записать своё состояние после регистрации
+    time.sleep(3)
+    patch_db_null_info()
     print("[DONE] Init completed successfully")
 
 
