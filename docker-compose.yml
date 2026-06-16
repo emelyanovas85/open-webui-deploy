@@ -13,8 +13,11 @@ services:
       - webui-data:/app/backend/data
     environment:
       # ── LLM Provider ─────────────────────────────────────────────────────
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
+      # Прямой OpenAI endpoint отключён — модели подключены через Pipe Function qwen_cbr.
+      # Open WebUI каждые ~13 сек дёргает /models через aiohttp без SSL-патча,
+      # что приводит к Connection error и пустому списку моделей.
+      - OPENAI_API_KEY=
+      - OPENAI_API_BASE_URL=
 
       # ── Ollama (отключён) ────────────────────────────────────────────
       - OLLAMA_BASE_URL=
