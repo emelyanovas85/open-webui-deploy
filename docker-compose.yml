@@ -13,9 +13,7 @@ services:
       - webui-data:/app/backend/data
     environment:
       # ── LLM Provider ─────────────────────────────────────────────────────
-      # Прямой OpenAI endpoint отключён — модели подключены через Pipe Function qwen_cbr.
-      # Open WebUI каждые ~13 сек дёргает /models через aiohttp без SSL-патча,
-      # что приводит к Connection error и пустому списку моделей.
+      # Прямой OpenAI endpoint отключён — модели подключены через Pipe Function cbr_models.
       - OPENAI_API_KEY=
       - OPENAI_API_BASE_URL=
 
@@ -48,7 +46,6 @@ services:
       - ENABLE_RAG_WEB_SEARCH=${ENABLE_RAG_WEB_SEARCH:-false}
 
       # ── SSL: sitecustomize.py патчит ssl.create_default_context через PYTHONPATH ────
-      # aiohttp игнорирует OPENSSL_CONF, но читает sitecustomize.py при старте
       - PYTHONPATH=/app/scripts
       - OPENSSL_CONF=/etc/ssl/openssl.cnf
       - REQUESTS_CA_BUNDLE=
@@ -76,6 +73,8 @@ services:
     image: open-webui-init:latest
     container_name: open-webui-init
     restart: "no"
+    depends_on:
+      - open-webui
     volumes:
       - webui-data:/app/backend/data
     environment:
@@ -85,7 +84,7 @@ services:
       - MCP_SERVER_URLS=${MCP_SERVER_URLS:-}
       - NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,open-webui
       - no_proxy=localhost,127.0.0.1,10.0.0.0/8,open-webui
-    command: python /scripts/init-openwebui.py
+    command: python /app/scripts/init-openwebui.py
     networks:
       - webui-net
 
