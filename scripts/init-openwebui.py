@@ -27,6 +27,13 @@ MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
 DB_PATH = "/app/backend/data/webui.db"
 
 
+def strip_sse_suffix(url: str) -> str:
+    """Open WebUI сам добавляет /sse к базовому URL — убираем его если есть."""
+    if url.endswith("/sse"):
+        return url[:-4]
+    return url
+
+
 def parse_mcp_servers():
     servers = []
     if MCP_SERVER_URLS_RAW:
@@ -35,13 +42,13 @@ def parse_mcp_servers():
             if not entry:
                 continue
             parts = entry.split("::")
-            url = parts[0].strip()
+            url = strip_sse_suffix(parts[0].strip())
             name = parts[1].strip() if len(parts) > 1 else url.split("/")[2].replace(":", "_")
             desc = parts[2].strip() if len(parts) > 2 else name
             servers.append({"url": url, "name": name, "description": desc})
     elif MCP_SERVER_URL_LEGACY:
         servers.append({
-            "url": MCP_SERVER_URL_LEGACY,
+            "url": strip_sse_suffix(MCP_SERVER_URL_LEGACY),
             "name": "mcp_server",
             "description": "MCP Tool Server",
         })
@@ -310,6 +317,10 @@ def add_mcp_tool_servers(token):
             print(f"[WARN] Could not parse /configs/tool_servers: {e}")
             existing_connections = []
 
+    # Нормализуем url в существующих подключениях (убираем /sse если есть)
+    for c in existing_connections:
+        c["url"] = strip_sse_suffix(c.get("url", ""))
+
     # Фиксим null info в существующих
     url_to_name = {srv["url"]: srv["name"] for srv in servers}
     for c in existing_connections:
@@ -322,12 +333,7 @@ def add_mcp_tool_servers(token):
     added = []
 
     for srv in servers:
-        url = srv["url"]
-        try:
-            from urllib.parse import urlparse
-            path = urlparse(url).path or "/sse"
-        except Exception:
-            path = "/sse"
+        url = srv["url"]  # уже без /sse (strip_sse_suffix в parse_mcp_servers)
 
         if url in existing_urls:
             print(f"[OK] MCP server already registered: {url}")
@@ -335,7 +341,7 @@ def add_mcp_tool_servers(token):
 
         new_connections.append({
             "url": url,
-            "path": path,
+            "path": "/sse",
             "type": "mcp",
             "auth_type": "none",
             "key": "",
@@ -369,6 +375,7 @@ def patch_db(db_path):
     Патчит БД напрямую:
     1. Отключает все OpenAI connections (если есть) — enabled=False
     2. Фиксит null info у MCP connections, используя имена из .env
+    3. Нормализует url MCP connections (убирает /sse суффикс)
     """
     url_to_name = {srv["url"]: srv["name"] for srv in parse_mcp_servers()}
     try:
@@ -398,9 +405,18 @@ def patch_db(db_path):
         else:
             print("[OK] DB: no active OpenAI connections found")
 
-        # 2. Фиксит null info у MCP connections с правильным именем
+        # 2. Нормализуем url и фиксим null info у MCP connections
         mcp_connections = data.get("tool_server", {}).get("connections", [])
         for c in mcp_connections:
+            # Нормализуем url — убираем /sse суффикс
+            old_url = c.get("url", "")
+            new_url = strip_sse_suffix(old_url)
+            if old_url != new_url:
+                c["url"] = new_url
+                c["path"] = "/sse"
+                patched = True
+                print(f"[PATCH] Normalized MCP url: {old_url} -> {new_url}")
+
             if c.get("info") is None:
                 url = c.get("url", "")
                 name = url_to_name.get(url, "mcp")
