@@ -27,11 +27,18 @@ MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
 DB_PATH = "/app/backend/data/webui.db"
 
 
-def strip_sse_suffix(url: str) -> str:
-    """Open WebUI сам добавляет /sse к базовому URL — убираем его если есть."""
+def detect_transport(url: str) -> dict:
+    """
+    Определяет тип транспорта MCP-сервера по суффиксу URL:
+    - URL заканчивается на /mcp  → Streamable HTTP, base_url = url без /mcp, path = /mcp
+    - URL заканчивается на /sse  → SSE, base_url = url без /sse, path = /sse
+    - Иначе                      → SSE (по умолчанию), base_url = url, path = /sse
+    """
+    if url.endswith("/mcp"):
+        return {"base_url": url[:-4], "path": "/mcp"}
     if url.endswith("/sse"):
-        return url[:-4]
-    return url
+        return {"base_url": url[:-4], "path": "/sse"}
+    return {"base_url": url, "path": "/sse"}
 
 
 def parse_mcp_servers():
@@ -42,13 +49,21 @@ def parse_mcp_servers():
             if not entry:
                 continue
             parts = entry.split("::")
-            url = strip_sse_suffix(parts[0].strip())
-            name = parts[1].strip() if len(parts) > 1 else url.split("/")[2].replace(":", "_")
+            raw_url = parts[0].strip()
+            transport = detect_transport(raw_url)
+            name = parts[1].strip() if len(parts) > 1 else raw_url.split("/")[2].replace(":", "_")
             desc = parts[2].strip() if len(parts) > 2 else name
-            servers.append({"url": url, "name": name, "description": desc})
+            servers.append({
+                "url": transport["base_url"],
+                "path": transport["path"],
+                "name": name,
+                "description": desc,
+            })
     elif MCP_SERVER_URL_LEGACY:
+        transport = detect_transport(MCP_SERVER_URL_LEGACY)
         servers.append({
-            "url": strip_sse_suffix(MCP_SERVER_URL_LEGACY),
+            "url": transport["base_url"],
+            "path": transport["path"],
             "name": "mcp_server",
             "description": "MCP Tool Server",
         })
@@ -317,15 +332,12 @@ def add_mcp_tool_servers(token):
             print(f"[WARN] Could not parse /configs/tool_servers: {e}")
             existing_connections = []
 
-    # Нормализуем url в существующих подключениях (убираем /sse если есть)
-    for c in existing_connections:
-        c["url"] = strip_sse_suffix(c.get("url", ""))
-
     # Фиксим null info в существующих
-    url_to_name = {srv["url"]: srv["name"] for srv in servers}
+    url_to_srv = {srv["url"]: srv for srv in servers}
     for c in existing_connections:
         if c.get("info") is None:
-            name = url_to_name.get(c.get("url", ""), "mcp")
+            srv = url_to_srv.get(c.get("url", ""), {})
+            name = srv.get("name", "mcp")
             c["info"] = make_stub_info(c.get("url", ""), name)
 
     existing_urls = {c.get("url", "") for c in existing_connections}
@@ -333,23 +345,25 @@ def add_mcp_tool_servers(token):
     added = []
 
     for srv in servers:
-        url = srv["url"]  # уже без /sse (strip_sse_suffix в parse_mcp_servers)
+        url = srv["url"]
+        path = srv["path"]  # /mcp для Streamable HTTP, /sse для SSE
 
         if url in existing_urls:
-            print(f"[OK] MCP server already registered: {url}")
+            print(f"[OK] MCP server already registered: {url} (path: {path})")
             continue
 
-        new_connections.append({
+        conn = {
             "url": url,
-            "path": "/sse",
+            "path": path,
             "type": "mcp",
             "auth_type": "none",
             "key": "",
             "headers": None,
             "config": {"enable": True},
             "info": make_stub_info(url, srv["name"]),
-        })
-        added.append((url, srv["name"]))
+        }
+        new_connections.append(conn)
+        added.append((url, srv["name"], path))
 
     if not added and not any(c.get("info") is None for c in existing_connections):
         print("[OK] All MCP servers already registered")
@@ -362,8 +376,8 @@ def add_mcp_tool_servers(token):
         timeout=15,
     )
     if r.status_code in (200, 201):
-        for url, name in added:
-            print(f"[OK] MCP server added: {name} -> {url}")
+        for url, name, path in added:
+            print(f"[OK] MCP server added: {name} -> {url} (path: {path})")
         if not added:
             print("[OK] MCP connections updated (stub info patched)")
     else:
@@ -375,9 +389,9 @@ def patch_db(db_path):
     Патчит БД напрямую:
     1. Отключает все OpenAI connections (если есть) — enabled=False
     2. Фиксит null info у MCP connections, используя имена из .env
-    3. Нормализует url MCP connections (убирает /sse суффикс)
+    3. Исправляет path у MCP connections согласно типу транспорта
     """
-    url_to_name = {srv["url"]: srv["name"] for srv in parse_mcp_servers()}
+    url_to_srv = {srv["url"]: srv for srv in parse_mcp_servers()}
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -405,21 +419,22 @@ def patch_db(db_path):
         else:
             print("[OK] DB: no active OpenAI connections found")
 
-        # 2. Нормализуем url и фиксим null info у MCP connections
+        # 2 & 3. Фиксим null info и path у MCP connections
         mcp_connections = data.get("tool_server", {}).get("connections", [])
         for c in mcp_connections:
-            # Нормализуем url — убираем /sse суффикс
-            old_url = c.get("url", "")
-            new_url = strip_sse_suffix(old_url)
-            if old_url != new_url:
-                c["url"] = new_url
-                c["path"] = "/sse"
+            url = c.get("url", "")
+            srv = url_to_srv.get(url, {})
+            correct_path = srv.get("path", "/sse") if srv else "/sse"
+
+            # Исправляем path если неверный
+            if c.get("path") != correct_path:
+                old_path = c.get("path")
+                c["path"] = correct_path
                 patched = True
-                print(f"[PATCH] Normalized MCP url: {old_url} -> {new_url}")
+                print(f"[PATCH] Fixed path for MCP {url}: {old_path} -> {correct_path}")
 
             if c.get("info") is None:
-                url = c.get("url", "")
-                name = url_to_name.get(url, "mcp")
+                name = srv.get("name", "mcp") if srv else "mcp"
                 c["info"] = {"id": url, "name": name, "version": "0.1.0"}
                 patched = True
                 print(f"[PATCH] Set info for MCP {url} -> name='{name}'")
@@ -437,6 +452,8 @@ def patch_db(db_path):
         print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
               f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
         print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
+        for c in mcp_connections:
+            print(f"[INFO]   {c.get('url')} path={c.get('path')}")
 
         conn.close()
     except Exception as e:
