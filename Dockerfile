@@ -1,21 +1,34 @@
 FROM ghcr.io/open-webui/open-webui:v0.9.6
 
-# Патч 1: исправляет UnboundLocalError 'server_id' в utils/tools.py
-#   при tool_id формата, не равного 2 или 3 частям через ':'
+# ─── Compatibility check ─────────────────────────────────────────────────────
+# Runs BEFORE any patch. Verifies that tools.py structure is compatible
+# with all three patches. Fails the build with a clear error if open-webui
+# was upgraded and the structure changed.
+COPY patches/check_patch_compat.py /tmp/check_patch_compat.py
+RUN python3 /tmp/check_patch_compat.py
+
+# ─── Patch 1 ─────────────────────────────────────────────────────────────────
+# Fixes UnboundLocalError 'server_id' in utils/tools.py
+# when tool_id format is not the expected 2 or 3 parts split by ':'.
 COPY patches/fix_tools_server_id.py /tmp/fix_tools_server_id.py
 RUN python3 /tmp/fix_tools_server_id.py
 
-# Патч 2: разрешает type='mcp' в get_tool_servers_data (utils/tools.py)
-#   open-webui v0.9.6 фильтрует серверы по type == 'openapi',
-#   MCP-серверы с type='mcp' молча игнорируются → инструменты не загружаются.
-#   Патч меняет условие на: type in ('openapi', 'mcp')
+# ─── Patch 2 ─────────────────────────────────────────────────────────────────
+# Allows type='mcp' in get_tool_servers_data (utils/tools.py).
+# open-webui v0.9.6 filters servers by type == 'openapi' — MCP servers
+# with type='mcp' are silently ignored and tools are never loaded.
+# Patch changes the condition to: type in ('openapi', 'mcp')
 COPY patches/fix_tools_type_filter.py /tmp/fix_tools_type_filter.py
 RUN python3 /tmp/fix_tools_type_filter.py
 
-# Патч 3: поддержка MCP Streamable HTTP транспорта (utils/tools.py)
-#   get_tool_server_data() делал GET с Accept: application/json ожидая OpenAPI spec,
-#   но Spring AI Streamable HTTP сервер возвращает 400 на такой запрос.
-#   Патч добавляет helper _mcp_streamable_initialize() который делает MCP
-#   initialize handshake через POST, и вставляет early-return для URL содержащих '/mcp'.
+# ─── Patch 3 (v4) ────────────────────────────────────────────────────────────
+# MCP Streamable HTTP transport support (utils/tools.py).
+# Changes from v3:
+#   - MCP detection is no longer based on '/mcp' in URL path.
+#     Now probes the URL with an MCP initialize request and checks
+#     for MCP response signature (serverInfo / protocolVersion).
+#     Falls through to OpenAPI path if probe fails or response is plain JSON.
+#   - Protocol version negotiation: tries '2025-03-26' first,
+#     falls back to '2024-11-05' on mismatch error.
 COPY patches/fix_mcp_streamable_http.py /tmp/fix_mcp_streamable_http.py
 RUN python3 /tmp/fix_mcp_streamable_http.py
