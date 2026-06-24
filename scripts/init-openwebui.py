@@ -6,8 +6,8 @@ init-openwebui.py — запускается один раз при старте
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
 3. Создаёт/обновляет Pipe Function + активирует её
-4. Полностью заменяет MCP Tool Servers (без дублей) согласно .env
-5. Патчит БД: отключает OpenAI connections, фиксит null info
+4. Полностью заменяет MCP Tool Servers (без дублей) согласно .env — ТОЛЬКО через API
+5. Патчит БД: отключает OpenAI connections, фиксит null info (MCP не трогает)
 """
 
 import os
@@ -329,8 +329,9 @@ def make_stub_info(url, name="mcp"):
 
 def sync_mcp_tool_servers(token):
     """
-    Полностью заменяет список MCP Tool Servers согласно .env.
+    Полностью заменяет список MCP Tool Servers согласно .env через API.
     Удаляет все старые/лишние записи — дублей не будет.
+    patch_db MCP не трогает — только этот метод управляет серверами.
     """
     servers = parse_mcp_servers()
     if not servers:
@@ -370,11 +371,9 @@ def sync_mcp_tool_servers(token):
 
 def patch_db(db_path):
     """
-    Патчит БД напрямую:
-    1. Отключает все OpenAI connections (если есть) — enabled=False
-    2. Заменяет все MCP connections согласно .env (без дублей)
+    Патчит БД напрямую — ТОЛЬКО отключает OpenAI connections.
+    MCP connections НЕ трогает (управляется через API в sync_mcp_tool_servers).
     """
-    servers = parse_mcp_servers()
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -389,7 +388,7 @@ def patch_db(db_path):
 
         patched = False
 
-        # 1. Отключаем OpenAI connections
+        # Отключаем OpenAI connections
         openai_connections = data.get("openai", {}).get("connections", [])
         disabled_count = 0
         for c in openai_connections:
@@ -401,32 +400,6 @@ def patch_db(db_path):
             print(f"[PATCH] Disabled {disabled_count} OpenAI connection(s) in DB")
         else:
             print("[OK] DB: no active OpenAI connections found")
-
-        # 2. Полностью заменяем MCP connections согласно .env
-        new_mcp = [
-            {
-                "url": srv["url"],
-                "path": srv["path"],
-                "type": "mcp",
-                "auth_type": "none",
-                "key": "",
-                "headers": None,
-                "config": {"enable": True},
-                "info": {"id": srv["url"], "name": srv["name"], "version": "0.1.0"},
-            }
-            for srv in servers
-        ]
-        old_mcp = data.get("tool_server", {}).get("connections", [])
-        if old_mcp != new_mcp:
-            if "tool_server" not in data:
-                data["tool_server"] = {}
-            data["tool_server"]["connections"] = new_mcp
-            patched = True
-            print(f"[PATCH] Replaced MCP connections in DB: {len(old_mcp)} old -> {len(new_mcp)} new")
-            for srv in servers:
-                print(f"[PATCH]   {srv['name']} -> {srv['url']} path={srv['path']}")
-        else:
-            print("[OK] DB: MCP connections already match .env")
 
         if patched:
             cur.execute(
@@ -440,8 +413,10 @@ def patch_db(db_path):
 
         print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
               f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
+
+        # Информационный вывод текущих MCP из БД (не меняем!)
         mcp_connections = data.get("tool_server", {}).get("connections", [])
-        print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
+        print(f"[INFO] MCP connections in DB (managed by API): {len(mcp_connections)}")
         for c in mcp_connections:
             print(f"[INFO]   {c.get('url')} path={c.get('path')}")
 
