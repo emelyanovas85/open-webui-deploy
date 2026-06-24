@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
 init-openwebui.py — запускается один раз при старте через open-webui-init контейнер.
-
-Что делает:
-1. Ждёт пока Open WebUI поднимется
-2. Получает JWT-токен администратора
-3. Создаёт/обновляет Pipe Function + активирует её
-4. Полностью заменяет MCP Tool Servers (без дублей) согласно .env — ТОЛЬКО через API
-5. Патчит БД: отключает OpenAI connections (MCP не трогает)
 """
 
 import os
@@ -71,8 +64,8 @@ PIPE_FUNCTION_CODE = """
 \"\"\"
 title: CBR Models
 author: local
-version: 4.0
-description: Dynamic CBR models list + full MCP tool calling loop.
+version: 4.1
+description: Dynamic CBR models list + full MCP tool calling loop with stateful session.
 \"\"\"
 
 import httpx
@@ -90,6 +83,8 @@ MCP_SERVERS = [
 
 MODELS_CACHE = []
 _mcp_tools_cache = None
+# session_id per server url
+_mcp_sessions = {}
 
 
 def get_ssl_context():
@@ -121,7 +116,81 @@ def fetch_models():
     return MODELS_CACHE
 
 
+def _parse_sse_body(text):
+    """Parse first data: line from SSE response body."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            data = line[5:].strip()
+            if data and data != "[DONE]":
+                try:
+                    return json.loads(data)
+                except Exception:
+                    pass
+    return {}
+
+
+def _mcp_post(url, payload, extra_headers=None):
+    """Low-level POST to MCP endpoint. Returns (response_dict, response_headers)."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        r = httpx.post(url, json=payload, headers=headers, timeout=15.0)
+        resp_headers = dict(r.headers)
+        # 202 Accepted = async, no body yet
+        if r.status_code == 202:
+            return {}, resp_headers
+        r.raise_for_status()
+        ct = r.headers.get("content-type", "")
+        if "text/event-stream" in ct:
+            return _parse_sse_body(r.text), resp_headers
+        if r.text.strip():
+            try:
+                return r.json(), resp_headers
+            except Exception:
+                pass
+        return {}, resp_headers
+    except Exception as e:
+        return {"error": str(e)}, {}
+
+
+def _mcp_initialize(server):
+    """Perform MCP initialize handshake, capture session ID from response headers."""
+    global _mcp_sessions
+    url = server["url"] + server["path"]
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.1"},
+        },
+    }
+    resp, resp_headers = _mcp_post(url, payload)
+
+    # Session ID may come as Mcp-Session-Id header (case-insensitive)
+    session_id = None
+    for k, v in resp_headers.items():
+        if k.lower() == "mcp-session-id":
+            session_id = v
+            break
+
+    # Some servers return session id inside the result body
+    if not session_id:
+        session_id = resp.get("result", {}).get("sessionId")
+
+    _mcp_sessions[server["url"]] = session_id
+    return session_id
+
+
 def _mcp_request(server, method, params=None):
+    """Send JSON-RPC request to MCP server, attaching session ID if available."""
     url = server["url"] + server["path"]
     payload = {
         "jsonrpc": "2.0",
@@ -129,25 +198,13 @@ def _mcp_request(server, method, params=None):
         "method": method,
         "params": params or {},
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    try:
-        r = httpx.post(url, json=payload, headers=headers, timeout=15.0)
-        r.raise_for_status()
-        ct = r.headers.get("content-type", "")
-        if "text/event-stream" in ct:
-            for line in r.text.splitlines():
-                line = line.strip()
-                if line.startswith("data:"):
-                    data = line[5:].strip()
-                    if data and data != "[DONE]":
-                        return json.loads(data)
-            return {}
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+    extra = {}
+    session_id = _mcp_sessions.get(server["url"])
+    if session_id:
+        extra["Mcp-Session-Id"] = session_id
+
+    resp, _ = _mcp_post(url, payload, extra)
+    return resp
 
 
 def _fetch_mcp_tools():
@@ -157,15 +214,14 @@ def _fetch_mcp_tools():
 
     tools_map = {}
     for srv in MCP_SERVERS:
-        _mcp_request(srv, "initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.0"},
-        })
-        resp = _mcp_request(srv, "tools/list")
-        tools = resp.get("result", {}).get("tools", [])
-        for t in tools:
-            tools_map[t["name"]] = {"server": srv, "schema": t}
+        try:
+            _mcp_initialize(srv)
+            resp = _mcp_request(srv, "tools/list")
+            tools = resp.get("result", {}).get("tools", [])
+            for t in tools:
+                tools_map[t["name"]] = {"server": srv, "schema": t}
+        except Exception:
+            pass
 
     _mcp_tools_cache = tools_map
     return tools_map
@@ -506,10 +562,8 @@ def patch_db(db_path):
         else:
             print("[OK] DB check passed - nothing to patch")
 
-        print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
-              f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
         mcp_connections = data.get("tool_server", {}).get("connections", [])
-        print(f"[INFO] MCP connections in DB (managed by API): {len(mcp_connections)}")
+        print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
         for c in mcp_connections:
             print(f"[INFO]   {c.get('url')} path={c.get('path')}")
 
