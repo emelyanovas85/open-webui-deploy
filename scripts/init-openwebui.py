@@ -6,7 +6,7 @@ init-openwebui.py — запускается один раз при старте
 1. Ждёт пока Open WebUI поднимется
 2. Получает JWT-токен администратора
 3. Создаёт/обновляет Pipe Function + активирует её
-4. Подключает MCP Tool Servers с понятными именами
+4. Полностью заменяет MCP Tool Servers (без дублей) согласно .env
 5. Патчит БД: отключает OpenAI connections, фиксит null info
 """
 
@@ -32,13 +32,13 @@ def detect_transport(url: str) -> dict:
     Определяет тип транспорта MCP-сервера по суффиксу URL:
     - URL заканчивается на /mcp  → Streamable HTTP, base_url = url без /mcp, path = /mcp
     - URL заканчивается на /sse  → SSE, base_url = url без /sse, path = /sse
-    - Иначе                      → SSE (по умолчанию), base_url = url, path = /sse
+    - Иначе                      → Streamable HTTP, base_url = url, path = /mcp
     """
     if url.endswith("/mcp"):
         return {"base_url": url[:-4], "path": "/mcp"}
     if url.endswith("/sse"):
         return {"base_url": url[:-4], "path": "/sse"}
-    return {"base_url": url, "path": "/sse"}
+    return {"base_url": url, "path": "/mcp"}
 
 
 def parse_mcp_servers():
@@ -327,7 +327,11 @@ def make_stub_info(url, name="mcp"):
     return {"id": url, "name": name, "version": "0.1.0"}
 
 
-def add_mcp_tool_servers(token):
+def sync_mcp_tool_servers(token):
+    """
+    Полностью заменяет список MCP Tool Servers согласно .env.
+    Удаляет все старые/лишние записи — дублей не будет.
+    """
     servers = parse_mcp_servers()
     if not servers:
         print("[SKIP] No MCP servers configured")
@@ -335,53 +339,21 @@ def add_mcp_tool_servers(token):
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    r = requests.get(f"{BASE_URL}/api/v1/configs/tool_servers", headers=headers, timeout=10)
-    if r.status_code != 200:
-        print(f"[WARN] GET /configs/tool_servers returned {r.status_code}: {r.text[:200]}")
-        existing_connections = []
-    else:
-        try:
-            existing_connections = r.json().get("TOOL_SERVER_CONNECTIONS", [])
-        except Exception as e:
-            print(f"[WARN] Could not parse /configs/tool_servers: {e}")
-            existing_connections = []
-
-    # Фиксим null info в существующих
-    url_to_srv = {srv["url"]: srv for srv in servers}
-    for c in existing_connections:
-        if c.get("info") is None:
-            srv = url_to_srv.get(c.get("url", ""), {})
-            name = srv.get("name", "mcp")
-            c["info"] = make_stub_info(c.get("url", ""), name)
-
-    existing_urls = {c.get("url", "") for c in existing_connections}
-    new_connections = list(existing_connections)
-    added = []
-
+    # Строим список исключительно из .env (никаких старых записей не сохраняем)
+    new_connections = []
     for srv in servers:
-        url = srv["url"]
-        path = srv["path"]  # /mcp для Streamable HTTP, /sse для SSE
-
-        if url in existing_urls:
-            print(f"[OK] MCP server already registered: {url} (path: {path})")
-            continue
-
         conn = {
-            "url": url,
-            "path": path,
+            "url": srv["url"],
+            "path": srv["path"],
             "type": "mcp",
             "auth_type": "none",
             "key": "",
             "headers": None,
             "config": {"enable": True},
-            "info": make_stub_info(url, srv["name"]),
+            "info": make_stub_info(srv["url"], srv["name"]),
         }
         new_connections.append(conn)
-        added.append((url, srv["name"], path))
-
-    if not added and not any(c.get("info") is None for c in existing_connections):
-        print("[OK] All MCP servers already registered")
-        return
+        print(f"[INFO] MCP server from .env: {srv['name']} -> {srv['url']} (path: {srv['path']})")
 
     r = requests.post(
         f"{BASE_URL}/api/v1/configs/tool_servers",
@@ -390,10 +362,8 @@ def add_mcp_tool_servers(token):
         timeout=15,
     )
     if r.status_code in (200, 201):
-        for url, name, path in added:
-            print(f"[OK] MCP server added: {name} -> {url} (path: {path})")
-        if not added:
-            print("[OK] MCP connections updated (stub info patched)")
+        for srv in servers:
+            print(f"[OK] MCP server synced: {srv['name']} -> {srv['url']} (path: {srv['path']})")
     else:
         print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
 
@@ -402,10 +372,9 @@ def patch_db(db_path):
     """
     Патчит БД напрямую:
     1. Отключает все OpenAI connections (если есть) — enabled=False
-    2. Фиксит null info у MCP connections, используя имена из .env
-    3. Исправляет path у MCP connections согласно типу транспорта
+    2. Заменяет все MCP connections согласно .env (без дублей)
     """
-    url_to_srv = {srv["url"]: srv for srv in parse_mcp_servers()}
+    servers = parse_mcp_servers()
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -433,25 +402,31 @@ def patch_db(db_path):
         else:
             print("[OK] DB: no active OpenAI connections found")
 
-        # 2 & 3. Фиксим null info и path у MCP connections
-        mcp_connections = data.get("tool_server", {}).get("connections", [])
-        for c in mcp_connections:
-            url = c.get("url", "")
-            srv = url_to_srv.get(url, {})
-            correct_path = srv.get("path", "/sse") if srv else "/sse"
-
-            # Исправляем path если неверный
-            if c.get("path") != correct_path:
-                old_path = c.get("path")
-                c["path"] = correct_path
-                patched = True
-                print(f"[PATCH] Fixed path for MCP {url}: {old_path} -> {correct_path}")
-
-            if c.get("info") is None:
-                name = srv.get("name", "mcp") if srv else "mcp"
-                c["info"] = {"id": url, "name": name, "version": "0.1.0"}
-                patched = True
-                print(f"[PATCH] Set info for MCP {url} -> name='{name}'")
+        # 2. Полностью заменяем MCP connections согласно .env
+        new_mcp = [
+            {
+                "url": srv["url"],
+                "path": srv["path"],
+                "type": "mcp",
+                "auth_type": "none",
+                "key": "",
+                "headers": None,
+                "config": {"enable": True},
+                "info": {"id": srv["url"], "name": srv["name"], "version": "0.1.0"},
+            }
+            for srv in servers
+        ]
+        old_mcp = data.get("tool_server", {}).get("connections", [])
+        if old_mcp != new_mcp:
+            if "tool_server" not in data:
+                data["tool_server"] = {}
+            data["tool_server"]["connections"] = new_mcp
+            patched = True
+            print(f"[PATCH] Replaced MCP connections in DB: {len(old_mcp)} old -> {len(new_mcp)} new")
+            for srv in servers:
+                print(f"[PATCH]   {srv['name']} -> {srv['url']} path={srv['path']}")
+        else:
+            print("[OK] DB: MCP connections already match .env")
 
         if patched:
             cur.execute(
@@ -465,6 +440,7 @@ def patch_db(db_path):
 
         print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
               f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
+        mcp_connections = data.get("tool_server", {}).get("connections", [])
         print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
         for c in mcp_connections:
             print(f"[INFO]   {c.get('url')} path={c.get('path')}")
@@ -487,7 +463,7 @@ def main():
         sys.exit(1)
 
     upsert_pipe_function(token)
-    add_mcp_tool_servers(token)
+    sync_mcp_tool_servers(token)
 
     # Ждём пока Open WebUI запишет свои defaults в БД
     time.sleep(5)
