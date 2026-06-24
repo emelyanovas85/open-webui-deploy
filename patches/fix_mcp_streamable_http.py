@@ -3,32 +3,27 @@
 Patches open_webui/utils/tools.py to support MCP Streamable HTTP transport
 (Spring AI / MCP SDK 0.10+).
 
-Fix (v4):
-  - MCP detection is no longer limited to URLs containing '/mcp'.
-    Detection is now done by probing: send initialize request and check
-    if the response looks like MCP (has 'result' key with 'serverInfo'
-    or 'protocolVersion'). If probe fails or response is plain OpenAPI,
-    fall through to the original OpenAPI path.
-  - Protocol version negotiation: tries '2025-03-26' first, falls back
-    to '2024-11-05' if server responds with protocol mismatch error.
-  - tools/list is always called unconditionally (stateless servers
-    like supergateway don't return Mcp-Session-Id).
+Fix (v5):
+  - Accept header order fixed: "text/event-stream, application/json"
+    Spring AI WebMvcStreamableServerTransportProvider requires text/event-stream
+    to appear first in the Accept header, otherwise returns -32601 error.
+  - All other logic identical to v4.
 """
 import sys
 
 path = "/app/backend/open_webui/utils/tools.py"
 
-SENTINEL = "# patched: mcp_streamable_http_v4"
+SENTINEL = "# patched: mcp_streamable_http_v5"
 
 HELPER = '''
 async def _is_mcp_server(url: str, headers: dict | None) -> bool:
     """Probe URL to check if it speaks MCP Streamable HTTP."""
-    # patched: mcp_streamable_http_v4
+    # patched: mcp_streamable_http_v5
     import uuid as _uuid
     import json as _json
 
     _headers = {
-        "Accept": "application/json, text/event-stream",
+        "Accept": "text/event-stream, application/json",
         "Content-Type": "application/json",
     }
     if headers:
@@ -78,12 +73,12 @@ async def _is_mcp_server(url: str, headers: dict | None) -> bool:
 
 async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
     """MCP Streamable HTTP: initialize (with version negotiation) + tools/list -> OpenAPI-compatible dict."""
-    # patched: mcp_streamable_http_v4
+    # patched: mcp_streamable_http_v5
     import uuid as _uuid
     import json as _json
 
     _headers = {
-        "Accept": "application/json, text/event-stream",
+        "Accept": "text/event-stream, application/json",
         "Content-Type": "application/json",
     }
     if headers:
@@ -224,7 +219,7 @@ async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
 '''
 
 # Early-return block: probe first, then call MCP init or fall through
-EARLY_RETURN = '''    # patched: mcp_streamable_http_v4
+EARLY_RETURN = '''    # patched: mcp_streamable_http_v5
     # Smart MCP detection: probe URL instead of checking URL path
     try:
         if await _is_mcp_server(url, headers):
@@ -237,12 +232,12 @@ EARLY_RETURN = '''    # patched: mcp_streamable_http_v4
 with open(path, encoding="utf-8") as f:
     lines = f.readlines()
 
-# Already patched v4?
-if any("patched: mcp_streamable_http_v4" in l for l in lines):
-    print("[PATCH] fix_mcp_streamable_http v4: already patched, skipping")
+# Already patched v5?
+if any("patched: mcp_streamable_http_v5" in l for l in lines):
+    print("[PATCH] fix_mcp_streamable_http v5: already patched, skipping")
     sys.exit(0)
 
-# Remove previous v1/v2/v3 patch artefacts
+# Remove previous v1/v2/v3/v4 patch artefacts
 clean = []
 skip_helper = False
 for l in lines:
@@ -304,4 +299,4 @@ if p_helper == 0 or p_return == 0:
 with open(path, "w", encoding="utf-8") as f:
     f.writelines(out)
 
-print("[PATCH] fix_mcp_streamable_http v4: tools.py written successfully")
+print("[PATCH] fix_mcp_streamable_http v5: tools.py written successfully")
