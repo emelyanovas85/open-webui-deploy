@@ -64,7 +64,7 @@ PIPE_FUNCTION_CODE = """
 \"\"\"
 title: CBR Models
 author: local
-version: 4.1
+version: 4.2
 description: Dynamic CBR models list + full MCP tool calling loop with stateful session.
 \"\"\"
 
@@ -83,7 +83,6 @@ MCP_SERVERS = [
 
 MODELS_CACHE = []
 _mcp_tools_cache = None
-# session_id per server url
 _mcp_sessions = {}
 
 
@@ -116,9 +115,9 @@ def fetch_models():
     return MODELS_CACHE
 
 
-def _parse_sse_body(text):
-    \"\"\"Parse first data: line from SSE response body.\"\"\"
-    for line in text.splitlines():
+def _parse_sse_lines(lines):
+    \"\"\"Parse first data: line from SSE text lines.\"\"\"
+    for line in lines:
         line = line.strip()
         if line.startswith("data:"):
             data = line[5:].strip()
@@ -131,29 +130,41 @@ def _parse_sse_body(text):
 
 
 def _mcp_post(url, payload, extra_headers=None):
-    \"\"\"Low-level POST to MCP endpoint. Returns (response_dict, response_headers).\"\"\"
+    \"\"\"POST to MCP endpoint with streaming SSE support. Returns (response_dict, response_headers).\"\"\"
+    # Java Spring AI MCP requires Accept header in this exact order
     headers = {
         "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
+        "Accept": "text/event-stream, application/json",
     }
     if extra_headers:
         headers.update(extra_headers)
     try:
-        r = httpx.post(url, json=payload, headers=headers, timeout=15.0)
-        resp_headers = dict(r.headers)
-        # 202 Accepted = async, no body yet
-        if r.status_code == 202:
-            return {}, resp_headers
-        r.raise_for_status()
-        ct = r.headers.get("content-type", "")
-        if "text/event-stream" in ct:
-            return _parse_sse_body(r.text), resp_headers
-        if r.text.strip():
-            try:
-                return r.json(), resp_headers
-            except Exception:
-                pass
-        return {}, resp_headers
+        with httpx.Client(timeout=httpx.Timeout(10.0, read=15.0)) as client:
+            with client.stream("POST", url, json=payload, headers=headers) as r:
+                resp_headers = dict(r.headers)
+                # 202 Accepted = async Streamable HTTP, no body
+                if r.status_code == 202:
+                    return {}, resp_headers
+                r.raise_for_status()
+                ct = r.headers.get("content-type", "")
+                lines = []
+                for line in r.iter_lines():
+                    lines.append(line)
+                    # Stop after first complete SSE event (empty line separator)
+                    if "text/event-stream" in ct and line.strip() == "" and any(
+                        l.strip().startswith("data:") for l in lines
+                    ):
+                        break
+                    # For non-SSE, collect all
+                if "text/event-stream" in ct:
+                    return _parse_sse_lines(lines), resp_headers
+                text = "\\n".join(lines).strip()
+                if text:
+                    try:
+                        return json.loads(text), resp_headers
+                    except Exception:
+                        pass
+                return {}, resp_headers
     except Exception as e:
         return {"error": str(e)}, {}
 
@@ -169,19 +180,16 @@ def _mcp_initialize(server):
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.1"},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.2"},
         },
     }
     resp, resp_headers = _mcp_post(url, payload)
 
-    # Session ID may come as Mcp-Session-Id header (case-insensitive)
     session_id = None
     for k, v in resp_headers.items():
         if k.lower() == "mcp-session-id":
             session_id = v
             break
-
-    # Some servers return session id inside the result body
     if not session_id:
         session_id = resp.get("result", {}).get("sessionId")
 
@@ -202,7 +210,6 @@ def _mcp_request(server, method, params=None):
     session_id = _mcp_sessions.get(server["url"])
     if session_id:
         extra["Mcp-Session-Id"] = session_id
-
     resp, _ = _mcp_post(url, payload, extra)
     return resp
 
