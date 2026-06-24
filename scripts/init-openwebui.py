@@ -14,47 +14,7 @@ BASE_URL = os.environ.get("WEBUI_BASE_URL", "http://open-webui:8080").rstrip("/"
 ADMIN_EMAIL = os.environ.get("WEBUI_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.environ.get("WEBUI_ADMIN_PASSWORD", "")
 
-MCP_SERVER_URLS_RAW = os.environ.get("MCP_SERVER_URLS", "")
-MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
-
 DB_PATH = "/app/backend/data/webui.db"
-
-
-def detect_transport(url: str) -> dict:
-    if url.endswith("/mcp"):
-        return {"base_url": url[:-4], "path": "/mcp"}
-    if url.endswith("/sse"):
-        return {"base_url": url[:-4], "path": "/sse"}
-    return {"base_url": url, "path": "/mcp"}
-
-
-def parse_mcp_servers():
-    servers = []
-    if MCP_SERVER_URLS_RAW:
-        for entry in MCP_SERVER_URLS_RAW.split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            parts = entry.split("::")
-            raw_url = parts[0].strip()
-            transport = detect_transport(raw_url)
-            name = parts[1].strip() if len(parts) > 1 else raw_url.split("/")[2].replace(":", "_")
-            desc = parts[2].strip() if len(parts) > 2 else name
-            servers.append({
-                "url": transport["base_url"],
-                "path": transport["path"],
-                "name": name,
-                "description": desc,
-            })
-    elif MCP_SERVER_URL_LEGACY:
-        transport = detect_transport(MCP_SERVER_URL_LEGACY)
-        servers.append({
-            "url": transport["base_url"],
-            "path": transport["path"],
-            "name": "mcp_server",
-            "description": "MCP Tool Server",
-        })
-    return servers
 
 
 PIPE_FUNCTION_ID = "cbr_models"
@@ -131,7 +91,6 @@ def _parse_sse_lines(lines):
 
 def _mcp_post(url, payload, extra_headers=None):
     \"\"\"POST to MCP endpoint with streaming SSE support. Returns (response_dict, response_headers).\"\"\"
-    # Java Spring AI MCP requires Accept header in this exact order
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json",
@@ -142,7 +101,6 @@ def _mcp_post(url, payload, extra_headers=None):
         with httpx.Client(timeout=httpx.Timeout(10.0, read=15.0)) as client:
             with client.stream("POST", url, json=payload, headers=headers) as r:
                 resp_headers = dict(r.headers)
-                # 202 Accepted = async Streamable HTTP, no body
                 if r.status_code == 202:
                     return {}, resp_headers
                 r.raise_for_status()
@@ -150,12 +108,10 @@ def _mcp_post(url, payload, extra_headers=None):
                 lines = []
                 for line in r.iter_lines():
                     lines.append(line)
-                    # Stop after first complete SSE event (empty line separator)
                     if "text/event-stream" in ct and line.strip() == "" and any(
                         l.strip().startswith("data:") for l in lines
                     ):
                         break
-                    # For non-SSE, collect all
                 if "text/event-stream" in ct:
                     return _parse_sse_lines(lines), resp_headers
                 text = "\\n".join(lines).strip()
@@ -170,7 +126,6 @@ def _mcp_post(url, payload, extra_headers=None):
 
 
 def _mcp_initialize(server):
-    \"\"\"Perform MCP initialize handshake, capture session ID from response headers.\"\"\"
     global _mcp_sessions
     url = server["url"] + server["path"]
     payload = {
@@ -184,7 +139,6 @@ def _mcp_initialize(server):
         },
     }
     resp, resp_headers = _mcp_post(url, payload)
-
     session_id = None
     for k, v in resp_headers.items():
         if k.lower() == "mcp-session-id":
@@ -192,13 +146,11 @@ def _mcp_initialize(server):
             break
     if not session_id:
         session_id = resp.get("result", {}).get("sessionId")
-
     _mcp_sessions[server["url"]] = session_id
     return session_id
 
 
 def _mcp_request(server, method, params=None):
-    \"\"\"Send JSON-RPC request to MCP server, attaching session ID if available.\"\"\"
     url = server["url"] + server["path"]
     payload = {
         "jsonrpc": "2.0",
@@ -218,7 +170,6 @@ def _fetch_mcp_tools():
     global _mcp_tools_cache
     if _mcp_tools_cache is not None:
         return _mcp_tools_cache
-
     tools_map = {}
     for srv in MCP_SERVERS:
         try:
@@ -229,7 +180,6 @@ def _fetch_mcp_tools():
                 tools_map[t["name"]] = {"server": srv, "schema": t}
         except Exception:
             pass
-
     _mcp_tools_cache = tools_map
     return tools_map
 
@@ -239,7 +189,6 @@ def _call_mcp_tool(tool_name, tool_args):
     entry = tools_map.get(tool_name)
     if not entry:
         return json.dumps({"error": "Tool " + tool_name + " not found in any MCP server"})
-
     srv = entry["server"]
     resp = _mcp_request(srv, "tools/call", {"name": tool_name, "arguments": tool_args})
     result = resp.get("result", {})
@@ -297,7 +246,6 @@ class Pipe:
                         "presence_penalty", "frequency_penalty"):
                 if key in extra:
                     payload[key] = extra[key]
-
         ssl_ctx = get_ssl_context()
         headers = {
             "Authorization": f"Bearer {API_KEY}",
@@ -306,7 +254,6 @@ class Pipe:
         if stream:
             headers["Accept"] = "text/event-stream"
             return self._stream_raw(payload, headers, ssl_ctx)
-
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
             r = client.post(f"{UPSTREAM_BASE}/chat/completions", headers=headers, json=payload)
             r.raise_for_status()
@@ -493,46 +440,6 @@ def upsert_pipe_function(token):
     print(f"[OK] Pipe function active: {is_active} (toggle status: {tr.status_code})")
 
 
-def make_stub_info(url, name="mcp"):
-    return {"id": url, "name": name, "version": "0.1.0"}
-
-
-def sync_mcp_tool_servers(token):
-    servers = parse_mcp_servers()
-    if not servers:
-        print("[SKIP] No MCP servers configured")
-        return
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    new_connections = []
-    for srv in servers:
-        conn = {
-            "url": srv["url"],
-            "path": srv["path"],
-            "type": "mcp",
-            "auth_type": "none",
-            "key": "",
-            "headers": None,
-            "config": {"enable": True},
-            "info": make_stub_info(srv["url"], srv["name"]),
-        }
-        new_connections.append(conn)
-        print(f"[INFO] MCP server from .env: {srv['name']} -> {srv['url']} (path: {srv['path']})")
-
-    r = requests.post(
-        f"{BASE_URL}/api/v1/configs/tool_servers",
-        headers=headers,
-        json={"TOOL_SERVER_CONNECTIONS": new_connections},
-        timeout=15,
-    )
-    if r.status_code in (200, 201):
-        for srv in servers:
-            print(f"[OK] MCP server synced: {srv['name']} -> {srv['url']} (path: {srv['path']})")
-    else:
-        print(f"[WARN] POST /configs/tool_servers {r.status_code}: {r.text[:300]}")
-
-
 def patch_db(db_path):
     try:
         conn = sqlite3.connect(db_path)
@@ -569,11 +476,6 @@ def patch_db(db_path):
         else:
             print("[OK] DB check passed - nothing to patch")
 
-        mcp_connections = data.get("tool_server", {}).get("connections", [])
-        print(f"[INFO] MCP connections in DB: {len(mcp_connections)}")
-        for c in mcp_connections:
-            print(f"[INFO]   {c.get('url')} path={c.get('path')}")
-
         conn.close()
     except Exception as e:
         print(f"[ERROR] DB patch failed: {e}")
@@ -592,7 +494,6 @@ def main():
         sys.exit(1)
 
     upsert_pipe_function(token)
-    sync_mcp_tool_servers(token)
 
     time.sleep(5)
     patch_db(DB_PATH)
