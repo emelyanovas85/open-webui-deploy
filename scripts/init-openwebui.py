@@ -5,6 +5,11 @@ init-openwebui.py — запускается один раз при старте
 MCP инструменты работают через Pipe Function cbr_models (зашита MCP_SERVERS).
 NATIVE tool server регистрация НЕ используется: Open WebUI при старте
 пытается подключиться к ним через /sse, получает 404 → exception в lifespan → WebSocket не стартует.
+
+MCP_SERVERS в Pipe Function генерируется динамически из переменной окружения MCP_SERVER_URLS
+(формат: url1::name1::desc1,url2::name2::desc2 — desc1 опционален).
+Пример:
+  MCP_SERVER_URLS=http://10.1.5.97:8086/mcp::Java MCP,http://10.1.5.97:8083::GitLab MCP
 """
 
 import os
@@ -23,12 +28,67 @@ DB_PATH = "/app/backend/data/webui.db"
 PIPE_FUNCTION_ID = "cbr_models"
 PIPE_FUNCTION_NAME = "CBR Models"
 
-PIPE_FUNCTION_CODE = """
+
+def parse_mcp_server_urls(env_value: str) -> list[dict]:
+    """
+    Парсит MCP_SERVER_URLS в список {"url": ..., "path": ..., "name": ...}.
+
+    Формат каждого элемента (через запятую):
+        url::name              — базовый url и имя
+        url::name::desc        — desc игнорируется (для совместимости с .env)
+
+    URL может содержать путь (/mcp) — он выносится в поле "path".
+    Если путь не указан — path = "/mcp" по умолчанию.
+
+    Примеры:
+        http://10.1.5.97:8086/mcp::☕ Java MCP (:8086)::desc
+        http://10.1.5.97:8083::🦊 GitLab MCP (:8083)
+    """
+    servers = []
+    for entry in env_value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("::")
+        raw_url = parts[0].strip()
+        name = parts[1].strip() if len(parts) > 1 else raw_url
+
+        # Разделяем base_url и path
+        from urllib.parse import urlparse
+        parsed = urlparse(raw_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path.rstrip("/") or "/mcp"
+
+        servers.append({"url": base_url, "path": path, "name": name})
+    return servers
+
+
+# ── Читаем MCP_SERVER_URLS из env ───────────────────────────────────────────
+_MCP_ENV = os.environ.get("MCP_SERVER_URLS", "")
+if _MCP_ENV:
+    _MCP_SERVERS_PARSED = parse_mcp_server_urls(_MCP_ENV)
+    print(f"[CONFIG] MCP_SERVER_URLS из env: {len(_MCP_SERVERS_PARSED)} сервер(ов)")
+    for s in _MCP_SERVERS_PARSED:
+        print(f"         • {s['name']}  {s['url']}{s['path']}")
+else:
+    # Fallback — жёстко заданные значения если env не задан
+    _MCP_SERVERS_PARSED = [
+        {"url": "http://10.1.5.97:8086", "path": "/mcp", "name": "Java MCP"},
+        {"url": "http://10.1.5.97:8083", "path": "/mcp", "name": "GitLab MCP"},
+    ]
+    print("[CONFIG] MCP_SERVER_URLS не задан — используются значения по умолчанию")
+
+# Сериализуем в JSON для вставки в код Pipe Function
+_MCP_SERVERS_JSON = json.dumps(_MCP_SERVERS_PARSED, ensure_ascii=False, indent=4)
+
+
+PIPE_FUNCTION_CODE = f"""\
 \"\"\"
 title: CBR Models
 author: local
-version: 4.2
+version: 4.3
 description: Dynamic CBR models list + full MCP tool calling loop with stateful session.
+             MCP_SERVERS генерируется автоматически из MCP_SERVER_URLS при деплое.
 \"\"\"
 
 import httpx
@@ -39,14 +99,12 @@ import uuid
 UPSTREAM_BASE = "https://chat.ehd-zr.cbr.ru/openai"
 API_KEY = "sk-09fd660cdc8640ac861fe85a16d2d2f1"
 
-MCP_SERVERS = [
-    {"url": "http://10.1.5.97:8086", "path": "/mcp", "name": "Java MCP"},
-    {"url": "http://10.1.5.97:8083", "path": "/mcp", "name": "GitLab MCP"},
-]
+# Генерируется автоматически из MCP_SERVER_URLS в .env при деплое (init-openwebui.py)
+MCP_SERVERS = {_MCP_SERVERS_JSON}
 
 MODELS_CACHE = []
 _mcp_tools_cache = None
-_mcp_sessions = {}
+_mcp_sessions = {{}}
 
 
 def get_ssl_context():
@@ -64,22 +122,22 @@ def fetch_models():
         ssl_ctx = get_ssl_context()
         with httpx.Client(verify=ssl_ctx, timeout=30.0) as client:
             r = client.get(
-                f"{UPSTREAM_BASE}/models",
-                headers={"Authorization": f"Bearer {API_KEY}"},
+                f"{{UPSTREAM_BASE}}/models",
+                headers={{"Authorization": f"Bearer {{API_KEY}}"}},
             )
             r.raise_for_status()
             data = r.json().get("data", [])
-            MODELS_CACHE = [{"id": m["id"], "name": m.get("name", m["id"])} for m in data]
+            MODELS_CACHE = [{{"id": m["id"], "name": m.get("name", m["id"])}} for m in data]
     except Exception:
         if not MODELS_CACHE:
             MODELS_CACHE = [
-                {"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4", "name": "Qwen3.5 397B (fallback)"},
+                {{"id": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4", "name": "Qwen3.5 397B (fallback)"}},
             ]
     return MODELS_CACHE
 
 
 def _parse_sse_lines(lines):
-    \"\"\"Parse first data: line from SSE text lines.\"\"\"
+    \\"\\"\\"Parse first data: line from SSE text lines.\\"\\"\\"
     for line in lines:
         line = line.strip()
         if line.startswith("data:"):
@@ -89,15 +147,15 @@ def _parse_sse_lines(lines):
                     return json.loads(data)
                 except Exception:
                     pass
-    return {}
+    return {{}}
 
 
 def _mcp_post(url, payload, extra_headers=None):
-    \"\"\"POST to MCP endpoint with streaming SSE support.\"\"\"
-    headers = {
+    \\"\\"\\"POST to MCP endpoint with streaming SSE support.\\"\\"\\"
+    headers = {{
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json",
-    }
+    }}
     if extra_headers:
         headers.update(extra_headers)
     try:
@@ -105,7 +163,7 @@ def _mcp_post(url, payload, extra_headers=None):
             with client.stream("POST", url, json=payload, headers=headers) as r:
                 resp_headers = dict(r.headers)
                 if r.status_code == 202:
-                    return {}, resp_headers
+                    return {{}}, resp_headers
                 r.raise_for_status()
                 ct = r.headers.get("content-type", "")
                 lines = []
@@ -123,24 +181,24 @@ def _mcp_post(url, payload, extra_headers=None):
                         return json.loads(text), resp_headers
                     except Exception:
                         pass
-                return {}, resp_headers
+                return {{}}, resp_headers
     except Exception as e:
-        return {"error": str(e)}, {}
+        return {{"error": str(e)}}, {{}}
 
 
 def _mcp_initialize(server):
     global _mcp_sessions
     url = server["url"] + server["path"]
-    payload = {
+    payload = {{
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
         "method": "initialize",
-        "params": {
+        "params": {{
             "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.2"},
-        },
-    }
+            "capabilities": {{}},
+            "clientInfo": {{"name": "cbr-pipe", "version": "4.3"}},
+        }},
+    }}
     resp, resp_headers = _mcp_post(url, payload)
     session_id = None
     for k, v in resp_headers.items():
@@ -148,20 +206,20 @@ def _mcp_initialize(server):
             session_id = v
             break
     if not session_id:
-        session_id = resp.get("result", {}).get("sessionId")
+        session_id = resp.get("result", {{}}).get("sessionId")
     _mcp_sessions[server["url"]] = session_id
     return session_id
 
 
 def _mcp_request(server, method, params=None):
     url = server["url"] + server["path"]
-    payload = {
+    payload = {{
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
         "method": method,
-        "params": params or {},
-    }
-    extra = {}
+        "params": params or {{}},
+    }}
+    extra = {{}}
     session_id = _mcp_sessions.get(server["url"])
     if session_id:
         extra["Mcp-Session-Id"] = session_id
@@ -173,14 +231,14 @@ def _fetch_mcp_tools():
     global _mcp_tools_cache
     if _mcp_tools_cache is not None:
         return _mcp_tools_cache
-    tools_map = {}
+    tools_map = {{}}
     for srv in MCP_SERVERS:
         try:
             _mcp_initialize(srv)
             resp = _mcp_request(srv, "tools/list")
-            tools = resp.get("result", {}).get("tools", [])
+            tools = resp.get("result", {{}}).get("tools", [])
             for t in tools:
-                tools_map[t["name"]] = {"server": srv, "schema": t}
+                tools_map[t["name"]] = {{"server": srv, "schema": t}}
         except Exception:
             pass
     _mcp_tools_cache = tools_map
@@ -191,10 +249,10 @@ def _call_mcp_tool(tool_name, tool_args):
     tools_map = _fetch_mcp_tools()
     entry = tools_map.get(tool_name)
     if not entry:
-        return json.dumps({"error": "Tool " + tool_name + " not found in any MCP server"})
+        return json.dumps({{"error": "Tool " + tool_name + " not found in any MCP server"}})
     srv = entry["server"]
-    resp = _mcp_request(srv, "tools/call", {"name": tool_name, "arguments": tool_args})
-    result = resp.get("result", {})
+    resp = _mcp_request(srv, "tools/call", {{"name": tool_name, "arguments": tool_args}})
+    result = resp.get("result", {{}})
     content = result.get("content", [])
     if isinstance(content, list):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
@@ -207,14 +265,14 @@ def _tools_for_llm():
     result = []
     for name, entry in tools_map.items():
         schema = entry["schema"]
-        result.append({
+        result.append({{
             "type": "function",
-            "function": {
+            "function": {{
                 "name": name,
                 "description": schema.get("description", ""),
-                "parameters": schema.get("inputSchema", {"type": "object", "properties": {}}),
-            },
-        })
+                "parameters": schema.get("inputSchema", {{"type": "object", "properties": {{}}}}),
+            }},
+        }})
     return result
 
 
@@ -226,7 +284,7 @@ class Pipe:
 
     def pipes(self):
         models = fetch_models()
-        return [{"id": m["id"], "name": m["name"]} for m in models]
+        return [{{"id": m["id"], "name": m["name"]}} for m in models]
 
     def _resolve_model_id(self, body):
         raw = body.get("model", "")
@@ -236,11 +294,11 @@ class Pipe:
         return raw
 
     def _llm_call(self, model, messages, tools, stream=False, extra=None):
-        payload = {
+        payload = {{
             "model": model,
             "messages": messages,
             "stream": stream,
-        }
+        }}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -250,21 +308,21 @@ class Pipe:
                 if key in extra:
                     payload[key] = extra[key]
         ssl_ctx = get_ssl_context()
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
+        headers = {{
+            "Authorization": f"Bearer {{API_KEY}}",
             "Content-Type": "application/json",
-        }
+        }}
         if stream:
             headers["Accept"] = "text/event-stream"
             return self._stream_raw(payload, headers, ssl_ctx)
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-            r = client.post(f"{UPSTREAM_BASE}/chat/completions", headers=headers, json=payload)
+            r = client.post(f"{{UPSTREAM_BASE}}/chat/completions", headers=headers, json=payload)
             r.raise_for_status()
             return r.json()
 
     def _stream_raw(self, payload, headers, ssl_ctx):
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-            with client.stream("POST", f"{UPSTREAM_BASE}/chat/completions",
+            with client.stream("POST", f"{{UPSTREAM_BASE}}/chat/completions",
                                headers=headers, json=payload) as r:
                 r.raise_for_status()
                 for line in r.iter_lines():
@@ -285,7 +343,7 @@ class Pipe:
                     choices = chunk.get("choices", [])
                     if not choices:
                         continue
-                    delta = choices[0].get("delta", {})
+                    delta = choices[0].get("delta", {{}})
                     content = delta.get("content")
                     if content:
                         yield content
@@ -294,8 +352,8 @@ class Pipe:
         model = self._resolve_model_id(body)
         messages = list(body.get("messages", []))
         stream = body.get("stream", False)
-        extra = {k: body[k] for k in ("temperature", "max_tokens", "top_p",
-                                       "presence_penalty", "frequency_penalty") if k in body}
+        extra = {{k: body[k] for k in ("temperature", "max_tokens", "top_p",
+                                       "presence_penalty", "frequency_penalty") if k in body}}
 
         tools = body.get("tools") or _tools_for_llm()
 
@@ -309,8 +367,8 @@ class Pipe:
             if use_stream:
                 return resp
 
-            choice = resp.get("choices", [{}])[0]
-            message = choice.get("message", {})
+            choice = resp.get("choices", [{{}}])[0]
+            message = choice.get("message", {{}})
             finish_reason = choice.get("finish_reason", "stop")
             tool_calls = message.get("tool_calls") or []
 
@@ -325,20 +383,20 @@ class Pipe:
             messages.append(message)
 
             for tc in tool_calls:
-                fn = tc.get("function", {})
+                fn = tc.get("function", {{}})
                 tool_name = fn.get("name", "")
                 try:
-                    tool_args = json.loads(fn.get("arguments", "{}"))
+                    tool_args = json.loads(fn.get("arguments", "{{}}"))
                 except Exception:
-                    tool_args = {}
+                    tool_args = {{}}
 
                 tool_result = _call_mcp_tool(tool_name, tool_args)
 
-                messages.append({
+                messages.append({{
                     "role": "tool",
                     "tool_call_id": tc.get("id", str(uuid.uuid4())),
                     "content": tool_result,
-                })
+                }})
 
         return "[Tool calling iteration limit reached]"
 """
