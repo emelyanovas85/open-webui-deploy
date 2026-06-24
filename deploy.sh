@@ -164,7 +164,7 @@ fi
 
 # ── Сборка и передача open-webui-init образа ────────────────────────────────────────────────────────
 log "Сборка образа ${INIT_IMAGE} локально из scripts/Dockerfile..."
-docker build -t "${INIT_IMAGE}" "${SCRIPT_DIR}/scripts" \
+docker build --no-cache -t "${INIT_IMAGE}" "${SCRIPT_DIR}/scripts" \
   || error "Не удалось собрать образ ${INIT_IMAGE}"
 LOCAL_INIT_ID=$(docker image inspect "${INIT_IMAGE}" --format '{{.Id}}')
 ok "Образ ${INIT_IMAGE} собран (ID: ${LOCAL_INIT_ID:7:12})"
