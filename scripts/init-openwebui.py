@@ -67,13 +67,13 @@ def parse_mcp_servers():
 PIPE_FUNCTION_ID = "cbr_models"
 PIPE_FUNCTION_NAME = "CBR Models"
 
-PIPE_FUNCTION_CODE = '''
-"""
+PIPE_FUNCTION_CODE = """
+\"\"\"
 title: CBR Models
 author: local
 version: 4.0
-description: Динамический список моделей с chat.ehd-zr.cbr.ru + полный MCP tool calling loop.
-"""
+description: Dynamic CBR models list + full MCP tool calling loop.
+\"\"\"
 
 import httpx
 import ssl
@@ -83,14 +83,13 @@ import uuid
 UPSTREAM_BASE = "https://chat.ehd-zr.cbr.ru/openai"
 API_KEY = "sk-09fd660cdc8640ac861fe85a16d2d2f1"
 
-# MCP серверы — Pipe сам ходит на них напрямую
 MCP_SERVERS = [
     {"url": "http://10.1.5.97:8086", "path": "/mcp", "name": "Java MCP"},
     {"url": "http://10.1.5.97:8083", "path": "/mcp", "name": "GitLab MCP"},
 ]
 
 MODELS_CACHE = []
-_mcp_tools_cache = None  # кэш инструментов: {"tool_name": {"server": ..., "schema": ...}}
+_mcp_tools_cache = None
 
 
 def get_ssl_context():
@@ -122,8 +121,7 @@ def fetch_models():
     return MODELS_CACHE
 
 
-def _mcp_request(server: dict, method: str, params: dict = None) -> dict:
-    """Отправляет JSON-RPC запрос на MCP сервер (Streamable HTTP)."""
+def _mcp_request(server, method, params=None):
     url = server["url"] + server["path"]
     payload = {
         "jsonrpc": "2.0",
@@ -138,10 +136,8 @@ def _mcp_request(server: dict, method: str, params: dict = None) -> dict:
     try:
         r = httpx.post(url, json=payload, headers=headers, timeout=15.0)
         r.raise_for_status()
-        # Streamable HTTP может вернуть SSE или plain JSON
         ct = r.headers.get("content-type", "")
         if "text/event-stream" in ct:
-            # Парсим первый data: ...
             for line in r.text.splitlines():
                 line = line.strip()
                 if line.startswith("data:"):
@@ -154,21 +150,18 @@ def _mcp_request(server: dict, method: str, params: dict = None) -> dict:
         return {"error": str(e)}
 
 
-def _fetch_mcp_tools() -> dict:
-    """Получает все инструменты со всех MCP серверов. Возвращает {tool_name: {server, schema}}."""
+def _fetch_mcp_tools():
     global _mcp_tools_cache
     if _mcp_tools_cache is not None:
         return _mcp_tools_cache
 
     tools_map = {}
     for srv in MCP_SERVERS:
-        # initialize
         _mcp_request(srv, "initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "cbr-pipe", "version": "4.0"},
         })
-        # tools/list
         resp = _mcp_request(srv, "tools/list")
         tools = resp.get("result", {}).get("tools", [])
         for t in tools:
@@ -178,12 +171,11 @@ def _fetch_mcp_tools() -> dict:
     return tools_map
 
 
-def _call_mcp_tool(tool_name: str, tool_args: dict) -> str:
-    """Вызывает инструмент на соответствующем MCP сервере."""
+def _call_mcp_tool(tool_name, tool_args):
     tools_map = _fetch_mcp_tools()
     entry = tools_map.get(tool_name)
     if not entry:
-        return json.dumps({"error": f"Tool \'{tool_name}\' not found in any MCP server"})
+        return json.dumps({"error": "Tool " + tool_name + " not found in any MCP server"})
 
     srv = entry["server"]
     resp = _mcp_request(srv, "tools/call", {"name": tool_name, "arguments": tool_args})
@@ -191,12 +183,11 @@ def _call_mcp_tool(tool_name: str, tool_args: dict) -> str:
     content = result.get("content", [])
     if isinstance(content, list):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-        return "\n".join(texts) if texts else json.dumps(result)
+        return "\\n".join(texts) if texts else json.dumps(result)
     return json.dumps(result)
 
 
-def _tools_for_llm() -> list:
-    """Возвращает список инструментов в формате OpenAI function calling."""
+def _tools_for_llm():
     tools_map = _fetch_mcp_tools()
     result = []
     for name, entry in tools_map.items():
@@ -222,15 +213,14 @@ class Pipe:
         models = fetch_models()
         return [{"id": m["id"], "name": m["name"]} for m in models]
 
-    def _resolve_model_id(self, body: dict) -> str:
+    def _resolve_model_id(self, body):
         raw = body.get("model", "")
-        prefix = f"{self.id}."
+        prefix = self.id + "."
         if raw.startswith(prefix):
             return raw[len(prefix):]
         return raw
 
-    def _llm_call(self, model: str, messages: list, tools: list, stream: bool = False, extra: dict = None):
-        """Один вызов LLM. Возвращает полный ответ (dict) или генератор чанков."""
+    def _llm_call(self, model, messages, tools, stream=False, extra=None):
         payload = {
             "model": model,
             "messages": messages,
@@ -252,17 +242,14 @@ class Pipe:
         }
         if stream:
             headers["Accept"] = "text/event-stream"
-
-        if stream:
             return self._stream_raw(payload, headers, ssl_ctx)
-        else:
-            with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-                r = client.post(f"{UPSTREAM_BASE}/chat/completions", headers=headers, json=payload)
-                r.raise_for_status()
-                return r.json()
+
+        with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
+            r = client.post(f"{UPSTREAM_BASE}/chat/completions", headers=headers, json=payload)
+            r.raise_for_status()
+            return r.json()
 
     def _stream_raw(self, payload, headers, ssl_ctx):
-        """Генератор стримингового ответа — только текстовые чанки."""
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
             with client.stream("POST", f"{UPSTREAM_BASE}/chat/completions",
                                headers=headers, json=payload) as r:
@@ -290,27 +277,24 @@ class Pipe:
                     if content:
                         yield content
 
-    def pipe(self, body: dict):
+    def pipe(self, body):
         model = self._resolve_model_id(body)
         messages = list(body.get("messages", []))
         stream = body.get("stream", False)
         extra = {k: body[k] for k in ("temperature", "max_tokens", "top_p",
                                        "presence_penalty", "frequency_penalty") if k in body}
 
-        # Если в body уже есть tools от Open WebUI — берём их, иначе получаем сами
         tools = body.get("tools") or _tools_for_llm()
 
-        # Agentic loop: вызываем LLM → если tool_calls → выполняем → добавляем results → снова LLM
         MAX_ITERATIONS = 10
         for iteration in range(MAX_ITERATIONS):
-            # На последней итерации или если нет инструментов — стримим финальный ответ
             is_last = (iteration == MAX_ITERATIONS - 1)
             use_stream = stream and (is_last or not tools)
 
             resp = self._llm_call(model, messages, tools if not is_last else [], stream=use_stream, extra=extra)
 
             if use_stream:
-                return resp  # генератор — Open WebUI сам стримит
+                return resp
 
             choice = resp.get("choices", [{}])[0]
             message = choice.get("message", {})
@@ -318,19 +302,15 @@ class Pipe:
             tool_calls = message.get("tool_calls") or []
 
             if not tool_calls or finish_reason == "stop":
-                # Финальный текстовый ответ
                 content = message.get("content", "")
                 if stream:
-                    # Имитируем стриминг одним чанком
-                    def _single_chunk(text):
+                    def _single(text):
                         yield text
-                    return _single_chunk(content)
+                    return _single(content)
                 return content
 
-            # Добавляем ответ модели с tool_calls в историю
             messages.append(message)
 
-            # Вызываем каждый инструмент и добавляем результаты
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 tool_name = fn.get("name", "")
@@ -347,9 +327,8 @@ class Pipe:
                     "content": tool_result,
                 })
 
-        # Fallback — если вышли из цикла без финального ответа
-        return "[Превышен лимит итераций tool calling]"
-'''
+        return "[Tool calling iteration limit reached]"
+"""
 
 
 def wait_for_webui(max_retries=30, delay=5):
@@ -492,10 +471,6 @@ def sync_mcp_tool_servers(token):
 
 
 def patch_db(db_path):
-    """
-    Патчит БД напрямую — ТОЛЬКО отключает OpenAI connections.
-    MCP connections НЕ трогает.
-    """
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -529,7 +504,7 @@ def patch_db(db_path):
             conn.commit()
             print("[OK] DB patched successfully")
         else:
-            print("[OK] DB check passed — nothing to patch")
+            print("[OK] DB check passed - nothing to patch")
 
         print(f"[INFO] OpenAI connections in DB: {len(openai_connections)} total, "
               f"{sum(1 for c in openai_connections if c.get('enabled'))} enabled")
