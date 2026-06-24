@@ -117,7 +117,7 @@ def fetch_models():
 
 
 def _parse_sse_body(text):
-    """Parse first data: line from SSE response body."""
+    \"\"\"Parse first data: line from SSE response body.\"\"\"
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("data:"):
@@ -131,7 +131,7 @@ def _parse_sse_body(text):
 
 
 def _mcp_post(url, payload, extra_headers=None):
-    """Low-level POST to MCP endpoint. Returns (response_dict, response_headers)."""
+    \"\"\"Low-level POST to MCP endpoint. Returns (response_dict, response_headers).\"\"\"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -159,7 +159,7 @@ def _mcp_post(url, payload, extra_headers=None):
 
 
 def _mcp_initialize(server):
-    """Perform MCP initialize handshake, capture session ID from response headers."""
+    \"\"\"Perform MCP initialize handshake, capture session ID from response headers.\"\"\"
     global _mcp_sessions
     url = server["url"] + server["path"]
     payload = {
@@ -190,7 +190,7 @@ def _mcp_initialize(server):
 
 
 def _mcp_request(server, method, params=None):
-    """Send JSON-RPC request to MCP server, attaching session ID if available."""
+    \"\"\"Send JSON-RPC request to MCP server, attaching session ID if available.\"\"\"
     url = server["url"] + server["path"]
     payload = {
         "jsonrpc": "2.0",
