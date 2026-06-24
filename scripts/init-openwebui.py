@@ -77,7 +77,7 @@ PIPE_FUNCTION_CODE = '''
 """
 title: CBR Models
 author: local
-version: 3.0
+version: 3.1
 description: Динамический список моделей с chat.ehd-zr.cbr.ru через SSL-совместимый Pipe.
 """
 
@@ -147,6 +147,11 @@ class Pipe:
                 payload[key] = body[key]
         if body.get("stream"):
             payload["stream"] = True
+        # Пробрасываем инструменты (MCP tools) если есть
+        if body.get("tools"):
+            payload["tools"] = body["tools"]
+        if body.get("tool_choice"):
+            payload["tool_choice"] = body["tool_choice"]
         return payload
 
     def _stream_response(self, payload: dict):
@@ -182,7 +187,12 @@ class Pipe:
                     choices = chunk.get("choices", [])
                     if not choices:
                         continue
-                    content = choices[0].get("delta", {}).get("content")
+                    delta = choices[0].get("delta", {})
+                    # Пробрасываем tool_calls из стриминга
+                    if delta.get("tool_calls"):
+                        yield chunk
+                        continue
+                    content = delta.get("content")
                     if content:
                         yield content
 
@@ -203,7 +213,11 @@ class Pipe:
             )
             r.raise_for_status()
             result = r.json()
-            return result["choices"][0]["message"]["content"]
+            # Если модель вернула tool_calls — возвращаем весь ответ целиком
+            choice = result["choices"][0]
+            if choice.get("message", {}).get("tool_calls"):
+                return result
+            return choice["message"]["content"]
 '''
 
 
