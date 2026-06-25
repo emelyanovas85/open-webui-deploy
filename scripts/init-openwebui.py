@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-init-openwebui.py — запускается один раз при старте через open-webui-init контейнер.
+init-openwebui.py -- runs once on startup via open-webui-init container.
 
-MCP инструменты работают через Pipe Function cbr_models (зашита MCP_SERVERS).
-NATIVE tool server регистрация НЕ используется.
+KEY: supergateway works in STATELESS mode -- each POST creates a new stdio process.
+So initialize + notifications/initialized + tools/list MUST go in ONE batch POST (JSON array).
 
-KEY: supergateway работает в STATELESS-режиме — каждый POST создаёт новый stdio-процесс.
-Поэтому initialize и tools/list ДОЛЖНЫ идти в ОДНОМ batch-запросе (JSON array).
-
-MCP_SERVER_URLS формат: url1::name1,url2::name2
-Пример:
+MCP_SERVER_URLS format: url1::name1,url2::name2
+Example:
   MCP_SERVER_URLS=http://10.1.5.97:8086/mcp::Java MCP,http://10.1.5.97:8083::GitLab MCP
 """
 
@@ -50,24 +47,27 @@ def parse_mcp_server_urls(env_value):
 _MCP_ENV = os.environ.get("MCP_SERVER_URLS", "")
 if _MCP_ENV:
     _MCP_SERVERS_PARSED = parse_mcp_server_urls(_MCP_ENV)
-    print("[CONFIG] MCP_SERVER_URLS из env: %d сервер(ов)" % len(_MCP_SERVERS_PARSED))
+    print("[CONFIG] MCP_SERVER_URLS from env: %d server(s)" % len(_MCP_SERVERS_PARSED))
     for s in _MCP_SERVERS_PARSED:
-        print("         • %s  %s%s" % (s["name"], s["url"], s["path"]))
+        print("         * %s  %s%s" % (s["name"], s["url"], s["path"]))
 else:
     _MCP_SERVERS_PARSED = [
         {"url": "http://10.1.5.97:8086", "path": "/mcp", "name": "Java MCP"},
         {"url": "http://10.1.5.97:8083", "path": "/mcp", "name": "GitLab MCP"},
     ]
-    print("[CONFIG] MCP_SERVER_URLS не задан — используются значения по умолчанию")
+    print("[CONFIG] MCP_SERVER_URLS not set -- using defaults")
 
 _MCP_SERVERS_JSON = json.dumps(_MCP_SERVERS_PARSED)
 
+# IMPORTANT: inside _PIPE_FUNCTION_TEMPLATE we must NOT use f-strings that contain
+# quotes or parentheses, because Open WebUI compiles the function code via compile()
+# and such constructs cause SyntaxError. Use % formatting or intermediate variables.
 _PIPE_FUNCTION_TEMPLATE = '''
 """
 title: CBR Models
 author: local
-version: 4.6
-description: Dynamic CBR models list + full MCP tool calling loop. Stateless MCP via batch requests.
+version: 4.7
+description: Dynamic CBR models list + MCP tool calling. Stateless MCP via batch requests.
 """
 
 import httpx
@@ -78,7 +78,6 @@ import uuid
 UPSTREAM_BASE = "https://chat.ehd-zr.cbr.ru/openai"
 API_KEY = "sk-09fd660cdc8640ac861fe85a16d2d2f1"
 
-# Генерируется автоматически из MCP_SERVER_URLS в .env при деплое
 MCP_SERVERS = __MCP_SERVERS_JSON__
 
 MODELS_CACHE = []
@@ -100,8 +99,8 @@ def fetch_models():
         ssl_ctx = get_ssl_context()
         with httpx.Client(verify=ssl_ctx, timeout=30.0) as client:
             r = client.get(
-                f"{UPSTREAM_BASE}/models",
-                headers={"Authorization": f"Bearer {API_KEY}"},
+                UPSTREAM_BASE + "/models",
+                headers={"Authorization": "Bearer " + API_KEY},
             )
             r.raise_for_status()
             data = r.json().get("data", [])
@@ -115,7 +114,6 @@ def fetch_models():
 
 
 def _parse_sse_batch(text):
-    """Parse all data: lines from SSE response, return list of JSON objects."""
     results = []
     for line in text.splitlines():
         line = line.strip()
@@ -124,7 +122,6 @@ def _parse_sse_batch(text):
             if data and data != "[DONE]":
                 try:
                     obj = json.loads(data)
-                    # batch response may be a list or single object
                     if isinstance(obj, list):
                         results.extend(obj)
                     else:
@@ -136,43 +133,42 @@ def _parse_sse_batch(text):
 
 def _mcp_batch(server, requests_list):
     """
-    Отправляет список JSON-RPC объектов в одном POST.
-    supergateway (stateless) обрабатывает весь batch в одном stdio-процессе,
-    поэтому initialize + notifications/initialized + tools/list должны быть
-    здесь, а не в отдельных запросах.
-    Возвращает список ответов (notification-запросы без id не возвращают ответ).
+    Send a JSON-RPC batch (list) in a single POST.
+    supergateway (stateless) processes the whole batch in one stdio process.
+    Returns list of response objects.
     """
     url = server["url"] + server["path"]
+    srv_name = server["name"]
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json",
     }
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0, read=20.0)) as client:
-            with client.stream("POST", url, content=json.dumps(requests_list), headers=headers) as r:
-                if r.status_code not in (200, 202):
-                    return []
-                ct = r.headers.get("content-type", "")
-                body = r.read().decode("utf-8", errors="ignore")
-                if "text/event-stream" in ct:
-                    return _parse_sse_batch(body)
-                body = body.strip()
-                if not body:
-                    return []
-                try:
-                    obj = json.loads(body)
-                    return obj if isinstance(obj, list) else [obj]
-                except Exception:
-                    return []
+            resp = client.post(url, content=json.dumps(requests_list), headers=headers)
+            if resp.status_code not in (200, 202):
+                print("[MCP] batch HTTP %d from %s" % (resp.status_code, srv_name))
+                return []
+            ct = resp.headers.get("content-type", "")
+            body = resp.text.strip()
+            if not body:
+                return []
+            if "text/event-stream" in ct:
+                return _parse_sse_batch(body)
+            try:
+                obj = json.loads(body)
+                return obj if isinstance(obj, list) else [obj]
+            except Exception:
+                return []
     except Exception as e:
-        print(f"[MCP] batch error ({server.get(\"name\")}): {e}")
+        print("[MCP] batch error from %s: %s" % (srv_name, str(e)))
         return []
 
 
 def _mcp_fetch_tools_stateless(server):
     """
-    Получает тулы с сервера одним batch-запросом:
-    [initialize, notifications/initialized (notification), tools/list]
+    Fetch tools in ONE batch: [initialize, notifications/initialized, tools/list]
+    Required because supergateway is stateless -- each POST is a new process.
     """
     init_id = str(uuid.uuid4())
     list_id = str(uuid.uuid4())
@@ -184,10 +180,9 @@ def _mcp_fetch_tools_stateless(server):
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "cbr-pipe", "version": "4.6"},
+                "clientInfo": {"name": "cbr-pipe", "version": "4.7"},
             },
         },
-        # notification — без id (не ждёт ответа)
         {
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -207,32 +202,28 @@ def _mcp_fetch_tools_stateless(server):
 
 
 def _fetch_mcp_tools():
-    """Load tools from all MCP servers. Cache сбрасывается если пустой."""
     global _mcp_tools_cache
     if _mcp_tools_cache is not None and len(_mcp_tools_cache) > 0:
         return _mcp_tools_cache
     tools_map = {}
     for srv in MCP_SERVERS:
+        srv_name = srv["name"]
         try:
             tools = _mcp_fetch_tools_stateless(srv)
             for t in tools:
                 tools_map[t["name"]] = {"server": srv, "schema": t}
-            if tools:
-                print(f"[MCP] Loaded {len(tools)} tools from {srv.get(\"name\")}")
-            else:
-                print(f"[MCP] No tools from {srv.get(\"name\")}")
+            print("[MCP] %d tools from %s" % (len(tools), srv_name))
         except Exception as e:
-            print(f"[MCP] Error loading tools from {srv.get(\"name\")}: {e}")
+            print("[MCP] error from %s: %s" % (srv_name, str(e)))
     _mcp_tools_cache = tools_map if tools_map else None
     return tools_map
 
 
 def _call_mcp_tool(tool_name, tool_args):
-    """Вызов тула также через batch: initialize + notifications/initialized + tools/call."""
     tools_map = _fetch_mcp_tools()
     entry = tools_map.get(tool_name) if tools_map else None
     if not entry:
-        return json.dumps({"error": "Tool " + tool_name + " not found in any MCP server"})
+        return json.dumps({"error": "Tool not found: " + tool_name})
     srv = entry["server"]
     init_id = str(uuid.uuid4())
     call_id = str(uuid.uuid4())
@@ -244,7 +235,7 @@ def _call_mcp_tool(tool_name, tool_args):
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "cbr-pipe", "version": "4.6"},
+                "clientInfo": {"name": "cbr-pipe", "version": "4.7"},
             },
         },
         {
@@ -264,10 +255,11 @@ def _call_mcp_tool(tool_name, tool_args):
             result = resp.get("result", {})
             content = result.get("content", [])
             if isinstance(content, list):
-                texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                texts = [c.get("text", "") for c in content
+                         if isinstance(c, dict) and c.get("type") == "text"]
                 return "\\n".join(texts) if texts else json.dumps(result)
             return json.dumps(result)
-    return json.dumps({"error": "No response for tool call"})
+    return json.dumps({"error": "No response for tool: " + tool_name})
 
 
 def _tools_for_llm():
@@ -282,7 +274,8 @@ def _tools_for_llm():
             "function": {
                 "name": name,
                 "description": schema.get("description", ""),
-                "parameters": schema.get("inputSchema", {"type": "object", "properties": {}}),
+                "parameters": schema.get("inputSchema",
+                    {"type": "object", "properties": {}}),
             },
         })
     return result
@@ -321,21 +314,29 @@ class Pipe:
                     payload[key] = extra[key]
         ssl_ctx = get_ssl_context()
         headers = {
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": "Bearer " + API_KEY,
             "Content-Type": "application/json",
         }
         if stream:
             headers["Accept"] = "text/event-stream"
             return self._stream_raw(payload, headers, ssl_ctx)
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-            r = client.post(f"{UPSTREAM_BASE}/chat/completions", headers=headers, json=payload)
+            r = client.post(
+                UPSTREAM_BASE + "/chat/completions",
+                headers=headers,
+                json=payload,
+            )
             r.raise_for_status()
             return r.json()
 
     def _stream_raw(self, payload, headers, ssl_ctx):
         with httpx.Client(verify=ssl_ctx, timeout=120.0) as client:
-            with client.stream("POST", f"{UPSTREAM_BASE}/chat/completions",
-                               headers=headers, json=payload) as r:
+            with client.stream(
+                "POST",
+                UPSTREAM_BASE + "/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as r:
                 r.raise_for_status()
                 for line in r.iter_lines():
                     if not line:
@@ -364,8 +365,9 @@ class Pipe:
         model = self._resolve_model_id(body)
         messages = list(body.get("messages", []))
         stream = body.get("stream", False)
-        extra = {k: body[k] for k in ("temperature", "max_tokens", "top_p",
-                                      "presence_penalty", "frequency_penalty") if k in body}
+        extra = {k: body[k] for k in
+                 ("temperature", "max_tokens", "top_p",
+                  "presence_penalty", "frequency_penalty") if k in body}
 
         tools = body.get("tools") or _tools_for_llm()
 
@@ -374,7 +376,13 @@ class Pipe:
             is_last = (iteration == MAX_ITERATIONS - 1)
             use_stream = stream and (is_last or not tools)
 
-            resp = self._llm_call(model, messages, tools if not is_last else [], stream=use_stream, extra=extra)
+            resp = self._llm_call(
+                model,
+                messages,
+                tools if not is_last else [],
+                stream=use_stream,
+                extra=extra,
+            )
 
             if use_stream:
                 return resp
@@ -396,18 +404,18 @@ class Pipe:
 
             for tc in tool_calls:
                 fn = tc.get("function", {})
-                tool_name = fn.get("name", "")
+                t_name = fn.get("name", "")
                 try:
-                    tool_args = json.loads(fn.get("arguments", "{}"))
+                    t_args = json.loads(fn.get("arguments", "{}"))
                 except Exception:
-                    tool_args = {}
+                    t_args = {}
 
-                tool_result = _call_mcp_tool(tool_name, tool_args)
+                t_result = _call_mcp_tool(t_name, t_args)
 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", str(uuid.uuid4())),
-                    "content": tool_result,
+                    "content": t_result,
                 })
 
         return "[Tool calling iteration limit reached]"
@@ -516,7 +524,6 @@ def upsert_pipe_function(token):
 
 
 def patch_db(db_path):
-    """Disable built-in OpenAI connections and clear any registered tool servers."""
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -528,7 +535,6 @@ def patch_db(db_path):
             return
         config_id, raw = row
         data = json.loads(raw)
-
         patched = False
 
         openai_connections = data.get("openai", {}).get("connections", [])
