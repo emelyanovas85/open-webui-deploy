@@ -64,7 +64,11 @@ else:
     ]
     print("[CONFIG] MCP_SERVER_URLS не задан — используются значения по умолчанию")
 
-_MCP_SERVERS_JSON = json.dumps(_MCP_SERVERS_PARSED, ensure_ascii=False, indent=4)
+# ensure_ascii=True (по умолчанию) — эмодзи и спецсимволы в именах серверов
+# превращаются в \uXXXX escapes. Это обязательно: Open WebUI компилирует
+# код Pipe Function через compile() и падает на не-ASCII символах.
+# indent убран — JSON в одну строку, нет риска проблем с многострочностью.
+_MCP_SERVERS_JSON = json.dumps(_MCP_SERVERS_PARSED)
 
 # Код Pipe Function — PLACEHOLDER будет заменён через str.replace, без f-string
 # чтобы избежать проблем с экранированием кавычек и фигурных скобок.
@@ -72,7 +76,7 @@ _PIPE_FUNCTION_TEMPLATE = '''
 """
 title: CBR Models
 author: local
-version: 4.3
+version: 4.4
 description: Dynamic CBR models list + full MCP tool calling loop with stateful session.
 """
 
@@ -160,7 +164,7 @@ def _mcp_post(url, payload, extra_headers=None):
                         break
                 if "text/event-stream" in ct:
                     return _parse_sse_lines(lines), resp_headers
-                text = "\n".join(lines).strip()
+                text = "\\n".join(lines).strip()
                 if text:
                     try:
                         return json.loads(text), resp_headers
@@ -181,7 +185,7 @@ def _mcp_initialize(server):
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.3"},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.4"},
         },
     }
     resp, resp_headers = _mcp_post(url, payload)
@@ -241,7 +245,7 @@ def _call_mcp_tool(tool_name, tool_args):
     content = result.get("content", [])
     if isinstance(content, list):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-        return "\n".join(texts) if texts else json.dumps(result)
+        return "\\n".join(texts) if texts else json.dumps(result)
     return json.dumps(result)
 
 
