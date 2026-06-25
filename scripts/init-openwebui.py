@@ -117,7 +117,7 @@ _PIPE_FUNCTION_TEMPLATE = '''
 """
 title: CBR Models
 author: local
-version: 4.8
+version: 4.9
 description: Dynamic CBR models list + MCP tool calling via stateful supergateway session.
 """
 
@@ -133,6 +133,24 @@ MCP_SERVERS = __MCP_SERVERS_JSON__
 
 MODELS_CACHE = []
 _mcp_tools_cache = None
+
+
+def _sanitize(text):
+    """Remove surrogate characters that cause utf-8 encode errors."""
+    if not isinstance(text, str):
+        return text
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
+def _safe_json(obj):
+    """Serialize to JSON safely -- replace surrogates, ensure ascii as fallback."""
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        try:
+            return json.dumps(obj, ensure_ascii=True)
+        except Exception:
+            return json.dumps({"error": "result contains non-serializable data"})
 
 
 def get_ssl_context():
@@ -193,7 +211,6 @@ def _mcp_post(url, session_id, payload):
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0, read=20.0)) as client:
             resp = client.post(url, content=json.dumps(payload), headers=headers)
-            # session id returned by server after initialize
             new_session = resp.headers.get("Mcp-Session-Id") or session_id
             if resp.status_code not in (200, 202):
                 return None, new_session
@@ -210,22 +227,14 @@ def _mcp_post(url, session_id, payload):
                     obj = None
             return obj, new_session
     except Exception as e:
-        srv = url
-        print("[MCP] POST error %s: %s" % (srv, str(e)))
+        print("[MCP] POST error %s: %s" % (url, str(e)))
         return None, session_id
 
 
 def _mcp_fetch_tools_stateful(server):
-    """
-    Fetch tools using stateful session (supergateway --stateful):
-      1. POST initialize  -> get Mcp-Session-Id
-      2. POST notifications/initialized  (with session id)
-      3. POST tools/list  (with session id)
-    """
     url = server["url"] + server["path"]
     srv_name = server["name"]
 
-    # Step 1: initialize
     init_id = str(uuid.uuid4())
     resp, session_id = _mcp_post(url, None, {
         "jsonrpc": "2.0",
@@ -234,20 +243,18 @@ def _mcp_fetch_tools_stateful(server):
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.8"},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.9"},
         },
     })
     if not resp or resp.get("id") != init_id:
         print("[MCP] initialize failed for %s" % srv_name)
         return []
 
-    # Step 2: notifications/initialized (no id = notification, no response expected)
     _mcp_post(url, session_id, {
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
     })
 
-    # Step 3: tools/list
     list_id = str(uuid.uuid4())
     resp2, _ = _mcp_post(url, session_id, {
         "jsonrpc": "2.0",
@@ -279,21 +286,14 @@ def _fetch_mcp_tools():
 
 
 def _call_mcp_tool(tool_name, tool_args):
-    """
-    Call a tool using a fresh stateful session:
-      1. initialize -> session_id
-      2. notifications/initialized
-      3. tools/call
-    """
     tools_map = _fetch_mcp_tools()
     entry = tools_map.get(tool_name) if tools_map else None
     if not entry:
-        return json.dumps({"error": "Tool not found: " + tool_name})
+        return _safe_json({"error": "Tool not found: " + tool_name})
     srv = entry["server"]
     url = srv["url"] + srv["path"]
     srv_name = srv["name"]
 
-    # Step 1: initialize
     init_id = str(uuid.uuid4())
     resp, session_id = _mcp_post(url, None, {
         "jsonrpc": "2.0",
@@ -302,19 +302,17 @@ def _call_mcp_tool(tool_name, tool_args):
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.8"},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.9"},
         },
     })
     if not resp or resp.get("id") != init_id:
-        return json.dumps({"error": "initialize failed for " + srv_name})
+        return _safe_json({"error": "initialize failed for " + srv_name})
 
-    # Step 2: notifications/initialized
     _mcp_post(url, session_id, {
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
     })
 
-    # Step 3: tools/call
     call_id = str(uuid.uuid4())
     resp2, _ = _mcp_post(url, session_id, {
         "jsonrpc": "2.0",
@@ -326,11 +324,13 @@ def _call_mcp_tool(tool_name, tool_args):
         result = resp2.get("result", {})
         content = result.get("content", [])
         if isinstance(content, list):
-            texts = [c.get("text", "") for c in content
-                     if isinstance(c, dict) and c.get("type") == "text"]
-            return "\\n".join(texts) if texts else json.dumps(result)
-        return json.dumps(result)
-    return json.dumps({"error": "No response for tool: " + tool_name})
+            texts = []
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    texts.append(_sanitize(c.get("text", "")))
+            return "\\n".join(texts) if texts else _safe_json(result)
+        return _safe_json(result)
+    return _safe_json({"error": "No response for tool: " + tool_name})
 
 
 def _tools_for_llm():
@@ -413,7 +413,7 @@ class Pipe:
                     if not line:
                         continue
                     if isinstance(line, bytes):
-                        line = line.decode("utf-8", errors="ignore")
+                        line = line.decode("utf-8", errors="replace")
                     line = line.strip()
                     if not line.startswith("data:"):
                         continue
@@ -430,7 +430,7 @@ class Pipe:
                     delta = choices[0].get("delta", {})
                     content = delta.get("content")
                     if content:
-                        yield content
+                        yield _sanitize(content)
 
     def pipe(self, body):
         model = self._resolve_model_id(body)
@@ -465,6 +465,7 @@ class Pipe:
 
             if not tool_calls or finish_reason == "stop":
                 content = message.get("content", "")
+                content = _sanitize(content) if content else ""
                 if stream:
                     def _single(text):
                         yield text
@@ -486,7 +487,7 @@ class Pipe:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", str(uuid.uuid4())),
-                    "content": t_result,
+                    "content": _sanitize(t_result),
                 })
 
         return "[Tool calling iteration limit reached]"
@@ -599,12 +600,7 @@ def make_stub_info(url, name="mcp"):
 
 
 def sync_mcp_tool_servers(token):
-    """Register MCP servers in Open WebUI UI via /api/v1/configs/tool_servers.
-
-    This makes tools visible in the chat interface (+ button -> Tools).
-    Called with a 10s delay after upsert_pipe_function to let the Open WebUI
-    lifespan fully complete before we register servers (avoids WebSocket crash).
-    """
+    """Register MCP servers in Open WebUI UI via /api/v1/configs/tool_servers."""
     servers = parse_mcp_servers()
     if not servers:
         print("[SKIP] No MCP servers configured (MCP_SERVER_URLS not set)")
@@ -641,12 +637,7 @@ def sync_mcp_tool_servers(token):
 
 
 def patch_db(db_path):
-    """Disable built-in OpenAI connections in DB config.
-
-    NOTE: tool_server.connections are NOT cleared here -- they are managed
-    by sync_mcp_tool_servers() via the API. Clearing them would wipe the
-    registered MCP servers and tools would disappear from the UI.
-    """
+    """Disable built-in OpenAI connections in DB config."""
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -701,8 +692,6 @@ def main():
 
     upsert_pipe_function(token)
 
-    # Extra delay to let Open WebUI lifespan fully complete before registering
-    # MCP servers -- prevents the /sse 404 -> lifespan exception -> WebSocket crash.
     print("[..] Waiting 10s for Open WebUI lifespan to settle...")
     time.sleep(10)
 
