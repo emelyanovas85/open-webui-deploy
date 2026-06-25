@@ -3,22 +3,25 @@
 Patches open_webui/utils/tools.py to support MCP Streamable HTTP transport
 (Spring AI / MCP SDK 0.10+).
 
-Fix (v5):
-  - Accept header order fixed: "text/event-stream, application/json"
-    Spring AI WebMvcStreamableServerTransportProvider requires text/event-stream
-    to appear first in the Accept header, otherwise returns -32601 error.
-  - All other logic identical to v4.
+Fix (v6):
+  - Added notifications/initialized between initialize and tools/list.
+    MCP protocol requires client to send notifications/initialized
+    (notification, no id, no response expected) after initialize
+    before any other request. Without this supergateway drops
+    subsequent tools/list in stateless mode.
+  - Protocol version negotiation retained from v5.
+  - Accept header order retained: "text/event-stream, application/json"
 """
 import sys
 
 path = "/app/backend/open_webui/utils/tools.py"
 
-SENTINEL = "# patched: mcp_streamable_http_v5"
+SENTINEL = "# patched: mcp_streamable_http_v6"
 
 HELPER = '''
 async def _is_mcp_server(url: str, headers: dict | None) -> bool:
     """Probe URL to check if it speaks MCP Streamable HTTP."""
-    # patched: mcp_streamable_http_v5
+    # patched: mcp_streamable_http_v6
     import uuid as _uuid
     import json as _json
 
@@ -72,8 +75,15 @@ async def _is_mcp_server(url: str, headers: dict | None) -> bool:
 
 
 async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
-    """MCP Streamable HTTP: initialize (with version negotiation) + tools/list -> OpenAPI-compatible dict."""
-    # patched: mcp_streamable_http_v5
+    """MCP Streamable HTTP: initialize -> notifications/initialized -> tools/list.
+
+    MCP protocol (2024-11-05 and 2025-03-26) requires three steps:
+      1. POST initialize          (id present, response expected)
+      2. POST notifications/initialized  (NO id, fire-and-forget, no response)
+      3. POST tools/list          (id present, response expected)
+    Without step 2, supergateway and compliant MCP servers may ignore tools/list.
+    """
+    # patched: mcp_streamable_http_v6
     import uuid as _uuid
     import json as _json
 
@@ -105,7 +115,7 @@ async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA)
     async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
 
-        # Step 1: initialize with protocol version negotiation
+        # ── Step 1: initialize (with protocol version negotiation) ────────────
         session_id = ""
         init_result = {}
         last_error = None
@@ -133,12 +143,11 @@ async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
                     ct = resp.headers.get("Content-Type", "")
                     text = await resp.text()
                     init_result = _parse_body(text, ct)
-                    # Check for protocol version mismatch error
                     err = init_result.get("error", {})
                     if err and err.get("code") in (-32602, -32600):
                         last_error = f"protocol mismatch for {proto_version}: {err}"
+                        session_id = ""
                         continue
-                    # Success
                     break
             except Exception as e:
                 last_error = str(e)
@@ -150,9 +159,27 @@ async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
         srv_name = server_info.get("name", url)
         srv_version = server_info.get("version", "0.1.0")
 
-        # Step 2: tools/list — always call, session_id optional
-        # Stateless servers (supergateway) don\'t return Mcp-Session-Id,
-        # but tools/list must still be called.
+        # ── Step 2: notifications/initialized (fire-and-forget, NO id) ────────
+        # MCP spec requires this notification before any subsequent request.
+        # It is a JSON-RPC notification (no "id" field) — no response expected.
+        # We send it and ignore the response body (server may return 202 or 200).
+        notif_headers = dict(_headers)
+        if session_id:
+            notif_headers["Mcp-Session-Id"] = session_id
+        notif_payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }
+        try:
+            async with session.post(
+                url, json=notif_payload, headers=notif_headers,
+                ssl=AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL
+            ) as _notif_resp:
+                pass  # fire-and-forget: discard body
+        except Exception:
+            pass  # non-fatal: some servers return 404 or close connection
+
+        # ── Step 3: tools/list ────────────────────────────────────────────────
         tools = []
         list_headers = dict(_headers)
         if session_id:
@@ -173,7 +200,7 @@ async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
                 list_result = _parse_body(text2, ct2)
                 tools = list_result.get("result", {}).get("tools", [])
 
-        # Step 3: build OpenAPI-compatible paths from tools
+        # ── Step 4: build OpenAPI-compatible paths from tools ─────────────────
         paths = {}
         for tool in tools:
             t_name = tool.get("name", "unknown")
@@ -218,9 +245,7 @@ async def _mcp_streamable_initialize(url: str, headers: dict | None) -> dict:
 
 '''
 
-# Early-return block: probe first, then call MCP init or fall through
-EARLY_RETURN = '''    # patched: mcp_streamable_http_v5
-    # Smart MCP detection: probe URL instead of checking URL path
+EARLY_RETURN = '''    # patched: mcp_streamable_http_v6
     try:
         if await _is_mcp_server(url, headers):
             return await _mcp_streamable_initialize(url, headers)
@@ -232,19 +257,17 @@ EARLY_RETURN = '''    # patched: mcp_streamable_http_v5
 with open(path, encoding="utf-8") as f:
     lines = f.readlines()
 
-# Already patched v5?
-if any("patched: mcp_streamable_http_v5" in l for l in lines):
-    print("[PATCH] fix_mcp_streamable_http v5: already patched, skipping")
+if any("patched: mcp_streamable_http_v6" in l for l in lines):
+    print("[PATCH] fix_mcp_streamable_http v6: already patched, skipping")
     sys.exit(0)
 
-# Remove previous v1/v2/v3/v4 patch artefacts
+# Remove previous v1-v5 patch artefacts
 clean = []
 skip_helper = False
 for l in lines:
     if "async def _is_mcp_server(" in l or "async def _mcp_streamable_initialize(" in l:
         skip_helper = True
     if skip_helper:
-        # Stop skipping when we hit a new top-level async def that is NOT our helpers
         if (l.startswith("async def ") and
                 "_is_mcp_server" not in l and
                 "_mcp_streamable_initialize" not in l):
@@ -252,11 +275,11 @@ for l in lines:
             clean.append(l)
         continue
     if "patched: mcp_streamable_http" in l:
-        continue  # drop old sentinel/early-return lines
+        continue
     if '"\'/mcp\' in url"' in l or "'/mcp' in url" in l or '"/mcp" in url' in l:
-        continue  # drop old early-return condition line
+        continue
     if "return await _mcp_streamable_initialize" in l:
-        continue  # drop old early-return body
+        continue
     if "MCP probe for" in l:
         continue
     clean.append(l)
@@ -269,17 +292,14 @@ p_helper = p_return = 0
 while i < len(lines):
     l = lines[i]
 
-    # Insert helpers just before get_tool_server_data definition
     if "async def get_tool_server_data(" in l and p_helper == 0:
         out.append(HELPER)
         p_helper += 1
 
     out.append(l)
 
-    # Insert early-return as first statements inside get_tool_server_data
     if "async def get_tool_server_data(" in l and p_return == 0:
         i += 1
-        # consume blank lines after def line
         while i < len(lines) and lines[i].strip() == "":
             out.append(lines[i])
             i += 1
@@ -299,4 +319,4 @@ if p_helper == 0 or p_return == 0:
 with open(path, "w", encoding="utf-8") as f:
     f.writelines(out)
 
-print("[PATCH] fix_mcp_streamable_http v5: tools.py written successfully")
+print("[PATCH] fix_mcp_streamable_http v6: tools.py written successfully")
