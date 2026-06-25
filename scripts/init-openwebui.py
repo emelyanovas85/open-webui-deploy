@@ -14,6 +14,11 @@ NOTE: supergateway MUST be started with --stateful flag.
 MCP_SERVER_URLS format: url1::name1,url2::name2
 Example:
   MCP_SERVER_URLS=http://10.1.5.97:8086/mcp::Java MCP,http://10.1.5.97:8083::GitLab MCP
+
+MCP Tool Servers are registered in Open WebUI UI via POST /api/v1/configs/tool_servers
+so that tools are visible in the chat interface (+/Tools button).
+Open WebUI will probe registered servers on startup — this is expected behaviour.
+Registration happens AFTER a 10s delay to let the lifespan fully complete.
 """
 
 import os
@@ -28,10 +33,47 @@ BASE_URL = os.environ.get("WEBUI_BASE_URL", "http://open-webui:8080").rstrip("/"
 ADMIN_EMAIL = os.environ.get("WEBUI_ADMIN_EMAIL", "")
 ADMIN_PASSWORD = os.environ.get("WEBUI_ADMIN_PASSWORD", "")
 
+MCP_SERVER_URLS_RAW = os.environ.get("MCP_SERVER_URLS", "")
+MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
+
 DB_PATH = "/app/backend/data/webui.db"
 
-PIPE_FUNCTION_ID = "cbr_models"
-PIPE_FUNCTION_NAME = "CBR Models"
+
+def detect_transport(url: str) -> dict:
+    if url.endswith("/mcp"):
+        return {"base_url": url[:-4], "path": "/mcp"}
+    if url.endswith("/sse"):
+        return {"base_url": url[:-4], "path": "/sse"}
+    return {"base_url": url, "path": "/mcp"}
+
+
+def parse_mcp_servers():
+    servers = []
+    if MCP_SERVER_URLS_RAW:
+        for entry in MCP_SERVER_URLS_RAW.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split("::")
+            raw_url = parts[0].strip()
+            transport = detect_transport(raw_url)
+            name = parts[1].strip() if len(parts) > 1 else raw_url.split("/")[2].replace(":", "_")
+            desc = parts[2].strip() if len(parts) > 2 else name
+            servers.append({
+                "url": transport["base_url"],
+                "path": transport["path"],
+                "name": name,
+                "description": desc,
+            })
+    elif MCP_SERVER_URL_LEGACY:
+        transport = detect_transport(MCP_SERVER_URL_LEGACY)
+        servers.append({
+            "url": transport["base_url"],
+            "path": transport["path"],
+            "name": "mcp_server",
+            "description": "MCP Tool Server",
+        })
+    return servers
 
 
 def parse_mcp_server_urls(env_value):
@@ -549,7 +591,59 @@ def upsert_pipe_function(token):
     print("[OK] Pipe function active: %s (toggle status: %d)" % (is_active, tr.status_code))
 
 
+def make_stub_info(url, name="mcp"):
+    return {"id": url, "name": name, "version": "0.1.0"}
+
+
+def sync_mcp_tool_servers(token):
+    """Register MCP servers in Open WebUI UI via /api/v1/configs/tool_servers.
+
+    This makes tools visible in the chat interface (+ button -> Tools).
+    Called with a 10s delay after upsert_pipe_function to let the Open WebUI
+    lifespan fully complete before we register servers (avoids WebSocket crash).
+    """
+    servers = parse_mcp_servers()
+    if not servers:
+        print("[SKIP] No MCP servers configured (MCP_SERVER_URLS not set)")
+        return
+
+    headers = {"Authorization": "Bearer %s" % token, "Content-Type": "application/json"}
+
+    new_connections = []
+    for srv in servers:
+        conn = {
+            "url": srv["url"],
+            "path": srv["path"],
+            "type": "mcp",
+            "auth_type": "none",
+            "key": "",
+            "headers": None,
+            "config": {"enable": True},
+            "info": make_stub_info(srv["url"], srv["name"]),
+        }
+        new_connections.append(conn)
+        print("[INFO] MCP server: %s -> %s (path: %s)" % (srv["name"], srv["url"], srv["path"]))
+
+    r = requests.post(
+        "%s/api/v1/configs/tool_servers" % BASE_URL,
+        headers=headers,
+        json={"TOOL_SERVER_CONNECTIONS": new_connections},
+        timeout=15,
+    )
+    if r.status_code in (200, 201):
+        for srv in servers:
+            print("[OK] MCP server registered: %s -> %s" % (srv["name"], srv["url"]))
+    else:
+        print("[WARN] POST /configs/tool_servers %d: %s" % (r.status_code, r.text[:300]))
+
+
 def patch_db(db_path):
+    """Disable built-in OpenAI connections in DB config.
+
+    NOTE: tool_server.connections are NOT cleared here — they are managed
+    by sync_mcp_tool_servers() via the API. Clearing them would wipe the
+    registered MCP servers and tools would disappear from the UI.
+    """
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -574,14 +668,6 @@ def patch_db(db_path):
             print("[PATCH] Disabled %d OpenAI connection(s) in DB" % disabled_count)
         else:
             print("[OK] DB: no active OpenAI connections found")
-
-        tool_servers = data.get("tool_server", {}).get("connections", [])
-        if tool_servers:
-            data.setdefault("tool_server", {})["connections"] = []
-            print("[PATCH] Cleared %d tool server connection(s) from DB" % len(tool_servers))
-            patched = True
-        else:
-            print("[OK] DB: no tool server connections to clear")
 
         if patched:
             cur.execute(
@@ -611,6 +697,13 @@ def main():
         sys.exit(1)
 
     upsert_pipe_function(token)
+
+    # Extra delay to let Open WebUI lifespan fully complete before registering
+    # MCP servers — prevents the /sse 404 -> lifespan exception -> WebSocket crash.
+    print("[..] Waiting 10s for Open WebUI lifespan to settle...")
+    time.sleep(10)
+
+    sync_mcp_tool_servers(token)
 
     time.sleep(5)
     patch_db(DB_PATH)
