@@ -31,11 +31,6 @@ PIPE_FUNCTION_NAME = "CBR Models"
 
 
 def parse_mcp_server_urls(env_value):
-    """
-    Парсит MCP_SERVER_URLS в список {url, path, name}.
-    Формат: url::name::desc (desc игнорируется), через запятую.
-    Если путь в URL не указан — path = /mcp по умолчанию.
-    """
     servers = []
     for entry in env_value.split(","):
         entry = entry.strip()
@@ -64,19 +59,13 @@ else:
     ]
     print("[CONFIG] MCP_SERVER_URLS не задан — используются значения по умолчанию")
 
-# ensure_ascii=True (по умолчанию) — эмодзи и спецсимволы в именах серверов
-# превращаются в \uXXXX escapes. Это обязательно: Open WebUI компилирует
-# код Pipe Function через compile() и падает на не-ASCII символах.
-# indent убран — JSON в одну строку, нет риска проблем с многострочностью.
 _MCP_SERVERS_JSON = json.dumps(_MCP_SERVERS_PARSED)
 
-# Код Pipe Function — PLACEHOLDER будет заменён через str.replace, без f-string
-# чтобы избежать проблем с экранированием кавычек и фигурных скобок.
 _PIPE_FUNCTION_TEMPLATE = '''
 """
 title: CBR Models
 author: local
-version: 4.4
+version: 4.5
 description: Dynamic CBR models list + full MCP tool calling loop with stateful session.
 """
 
@@ -140,7 +129,7 @@ def _parse_sse_lines(lines):
 
 
 def _mcp_post(url, payload, extra_headers=None):
-    """POST to MCP endpoint with streaming SSE support."""
+    """POST to MCP endpoint — supports SSE (text/event-stream) and plain JSON."""
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json",
@@ -175,6 +164,22 @@ def _mcp_post(url, payload, extra_headers=None):
         return {"error": str(e)}, {}
 
 
+def _mcp_notify(url, method, extra_headers=None):
+    """Send JSON-RPC notification (no id, no response expected)."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    payload = {"jsonrpc": "2.0", "method": method}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(5.0, read=5.0)) as client:
+            client.post(url, json=payload, headers=headers)
+    except Exception:
+        pass
+
+
 def _mcp_initialize(server):
     global _mcp_sessions
     url = server["url"] + server["path"]
@@ -185,10 +190,12 @@ def _mcp_initialize(server):
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "cbr-pipe", "version": "4.4"},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.5"},
         },
     }
     resp, resp_headers = _mcp_post(url, payload)
+
+    # Извлекаем session id из заголовка ответа
     session_id = None
     for k, v in resp_headers.items():
         if k.lower() == "mcp-session-id":
@@ -196,7 +203,18 @@ def _mcp_initialize(server):
             break
     if not session_id:
         session_id = resp.get("result", {}).get("sessionId")
+
     _mcp_sessions[server["url"]] = session_id
+
+    # ОБЯЗАТЕЛЬНО: по протоколу MCP 2024-11-05 / 2025-03-26 после initialize
+    # клиент должен отправить notifications/initialized прежде чем делать
+    # любые другие запросы. Без этого Streamable HTTP сервер (supergateway)
+    # игнорирует tools/list и возвращает пустой или ошибочный результат.
+    notify_headers = {}
+    if session_id:
+        notify_headers["Mcp-Session-Id"] = session_id
+    _mcp_notify(url, "notifications/initialized", notify_headers)
+
     return session_id
 
 
@@ -217,9 +235,16 @@ def _mcp_request(server, method, params=None):
 
 
 def _fetch_mcp_tools():
+    """Загружает тулы со всех MCP серверов.
+    Кэш сбрасывается если он пустой (все серверы не ответили при прошлой попытке),
+    чтобы при следующем вызове была новая попытка подключения.
+    """
     global _mcp_tools_cache
-    if _mcp_tools_cache is not None:
+    if _mcp_tools_cache is not None and len(_mcp_tools_cache) > 0:
         return _mcp_tools_cache
+    # Сбрасываем сессии чтобы переинициализировать при повторной попытке
+    global _mcp_sessions
+    _mcp_sessions = {}
     tools_map = {}
     for srv in MCP_SERVERS:
         try:
@@ -228,15 +253,17 @@ def _fetch_mcp_tools():
             tools = resp.get("result", {}).get("tools", [])
             for t in tools:
                 tools_map[t["name"]] = {"server": srv, "schema": t}
-        except Exception:
-            pass
-    _mcp_tools_cache = tools_map
+        except Exception as e:
+            # Логируем ошибку — видно в Open WebUI Function logs
+            print(f"[MCP] Failed to load tools from {srv.get('name')}: {e}")
+    # Сохраняем только если нашли хотя бы один тул; иначе None — повторная попытка
+    _mcp_tools_cache = tools_map if tools_map else None
     return tools_map
 
 
 def _call_mcp_tool(tool_name, tool_args):
     tools_map = _fetch_mcp_tools()
-    entry = tools_map.get(tool_name)
+    entry = tools_map.get(tool_name) if tools_map else None
     if not entry:
         return json.dumps({"error": "Tool " + tool_name + " not found in any MCP server"})
     srv = entry["server"]
@@ -251,6 +278,8 @@ def _call_mcp_tool(tool_name, tool_args):
 
 def _tools_for_llm():
     tools_map = _fetch_mcp_tools()
+    if not tools_map:
+        return []
     result = []
     for name, entry in tools_map.items():
         schema = entry["schema"]
@@ -493,9 +522,7 @@ def upsert_pipe_function(token):
 
 
 def patch_db(db_path):
-    """Disable built-in OpenAI connections and clear any registered tool servers
-    to prevent Open WebUI from trying to connect to MCP servers via /sse on startup.
-    """
+    """Disable built-in OpenAI connections and clear any registered tool servers."""
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
