@@ -17,7 +17,7 @@ Example:
 
 MCP Tool Servers are registered in Open WebUI UI via POST /api/v1/configs/tool_servers
 so that tools are visible in the chat interface (+/Tools button).
-Open WebUI will probe registered servers on startup — this is expected behaviour.
+Open WebUI will probe registered servers on startup -- this is expected behaviour.
 Registration happens AFTER a 10s delay to let the lifespan fully complete.
 """
 
@@ -37,6 +37,9 @@ MCP_SERVER_URLS_RAW = os.environ.get("MCP_SERVER_URLS", "")
 MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
 
 DB_PATH = "/app/backend/data/webui.db"
+
+PIPE_FUNCTION_ID = "cbr_models"
+PIPE_FUNCTION_NAME = "CBR Models"
 
 
 def detect_transport(url: str) -> dict:
@@ -640,7 +643,7 @@ def sync_mcp_tool_servers(token):
 def patch_db(db_path):
     """Disable built-in OpenAI connections in DB config.
 
-    NOTE: tool_server.connections are NOT cleared here — they are managed
+    NOTE: tool_server.connections are NOT cleared here -- they are managed
     by sync_mcp_tool_servers() via the API. Clearing them would wipe the
     registered MCP servers and tools would disappear from the UI.
     """
@@ -699,7 +702,7 @@ def main():
     upsert_pipe_function(token)
 
     # Extra delay to let Open WebUI lifespan fully complete before registering
-    # MCP servers — prevents the /sse 404 -> lifespan exception -> WebSocket crash.
+    # MCP servers -- prevents the /sse 404 -> lifespan exception -> WebSocket crash.
     print("[..] Waiting 10s for Open WebUI lifespan to settle...")
     time.sleep(10)
 
