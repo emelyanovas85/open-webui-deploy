@@ -2,8 +2,14 @@
 """
 init-openwebui.py -- runs once on startup via open-webui-init container.
 
-KEY: supergateway works in STATELESS mode -- each POST creates a new stdio process.
-So initialize + notifications/initialized + tools/list MUST go in ONE batch POST (JSON array).
+MCP protocol (Streamable HTTP, stateful mode):
+  1. POST /mcp  initialize            -> response contains Mcp-Session-Id header
+  2. POST /mcp  notifications/initialized  (with Mcp-Session-Id)
+  3. POST /mcp  tools/list            (with Mcp-Session-Id)
+  4. POST /mcp  tools/call            (with Mcp-Session-Id)
+
+NOTE: supergateway MUST be started with --stateful flag.
+      Without it every POST is a new process and session is lost between requests.
 
 MCP_SERVER_URLS format: url1::name1,url2::name2
 Example:
@@ -60,14 +66,14 @@ else:
 _MCP_SERVERS_JSON = json.dumps(_MCP_SERVERS_PARSED)
 
 # IMPORTANT: inside _PIPE_FUNCTION_TEMPLATE we must NOT use f-strings that contain
-# quotes or parentheses, because Open WebUI compiles the function code via compile()
-# and such constructs cause SyntaxError. Use % formatting or intermediate variables.
+# quotes or parentheses -- Open WebUI compiles the code via compile() and such
+# constructs cause SyntaxError. Use % formatting or intermediate variables only.
 _PIPE_FUNCTION_TEMPLATE = '''
 """
 title: CBR Models
 author: local
-version: 4.7
-description: Dynamic CBR models list + MCP tool calling. Stateless MCP via batch requests.
+version: 4.8
+description: Dynamic CBR models list + MCP tool calling via stateful supergateway session.
 """
 
 import httpx
@@ -113,91 +119,99 @@ def fetch_models():
     return MODELS_CACHE
 
 
-def _parse_sse_batch(text):
-    results = []
+def _parse_sse(text):
+    """Extract first JSON object from SSE data: lines."""
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("data:"):
             data = line[5:].strip()
             if data and data != "[DONE]":
                 try:
-                    obj = json.loads(data)
-                    if isinstance(obj, list):
-                        results.extend(obj)
-                    else:
-                        results.append(obj)
+                    return json.loads(data)
                 except Exception:
                     pass
-    return results
+    return None
 
 
-def _mcp_batch(server, requests_list):
+def _mcp_post(url, session_id, payload):
     """
-    Send a JSON-RPC batch (list) in a single POST.
-    supergateway (stateless) processes the whole batch in one stdio process.
-    Returns list of response objects.
+    Single POST to MCP endpoint.
+    Returns (response_dict_or_None, session_id_str).
+    session_id from initialize response header is returned for subsequent calls.
     """
-    url = server["url"] + server["path"]
-    srv_name = server["name"]
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json",
     }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0, read=20.0)) as client:
-            resp = client.post(url, content=json.dumps(requests_list), headers=headers)
+            resp = client.post(url, content=json.dumps(payload), headers=headers)
+            # session id returned by server after initialize
+            new_session = resp.headers.get("Mcp-Session-Id") or session_id
             if resp.status_code not in (200, 202):
-                print("[MCP] batch HTTP %d from %s" % (resp.status_code, srv_name))
-                return []
+                return None, new_session
             ct = resp.headers.get("content-type", "")
             body = resp.text.strip()
             if not body:
-                return []
+                return None, new_session
             if "text/event-stream" in ct:
-                return _parse_sse_batch(body)
-            try:
-                obj = json.loads(body)
-                return obj if isinstance(obj, list) else [obj]
-            except Exception:
-                return []
+                obj = _parse_sse(body)
+            else:
+                try:
+                    obj = json.loads(body)
+                except Exception:
+                    obj = None
+            return obj, new_session
     except Exception as e:
-        print("[MCP] batch error from %s: %s" % (srv_name, str(e)))
+        srv = url
+        print("[MCP] POST error %s: %s" % (srv, str(e)))
+        return None, session_id
+
+
+def _mcp_fetch_tools_stateful(server):
+    """
+    Fetch tools using stateful session (supergateway --stateful):
+      1. POST initialize  -> get Mcp-Session-Id
+      2. POST notifications/initialized  (with session id)
+      3. POST tools/list  (with session id)
+    """
+    url = server["url"] + server["path"]
+    srv_name = server["name"]
+
+    # Step 1: initialize
+    init_id = str(uuid.uuid4())
+    resp, session_id = _mcp_post(url, None, {
+        "jsonrpc": "2.0",
+        "id": init_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.8"},
+        },
+    })
+    if not resp or resp.get("id") != init_id:
+        print("[MCP] initialize failed for %s" % srv_name)
         return []
 
+    # Step 2: notifications/initialized (no id = notification, no response expected)
+    _mcp_post(url, session_id, {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    })
 
-def _mcp_fetch_tools_stateless(server):
-    """
-    Fetch tools in ONE batch: [initialize, notifications/initialized, tools/list]
-    Required because supergateway is stateless -- each POST is a new process.
-    """
-    init_id = str(uuid.uuid4())
+    # Step 3: tools/list
     list_id = str(uuid.uuid4())
-    batch = [
-        {
-            "jsonrpc": "2.0",
-            "id": init_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "cbr-pipe", "version": "4.7"},
-            },
-        },
-        {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        },
-        {
-            "jsonrpc": "2.0",
-            "id": list_id,
-            "method": "tools/list",
-            "params": {},
-        },
-    ]
-    responses = _mcp_batch(server, batch)
-    for resp in responses:
-        if isinstance(resp, dict) and resp.get("id") == list_id:
-            return resp.get("result", {}).get("tools", [])
+    resp2, _ = _mcp_post(url, session_id, {
+        "jsonrpc": "2.0",
+        "id": list_id,
+        "method": "tools/list",
+        "params": {},
+    })
+    if resp2 and resp2.get("id") == list_id:
+        return resp2.get("result", {}).get("tools", [])
     return []
 
 
@@ -209,7 +223,7 @@ def _fetch_mcp_tools():
     for srv in MCP_SERVERS:
         srv_name = srv["name"]
         try:
-            tools = _mcp_fetch_tools_stateless(srv)
+            tools = _mcp_fetch_tools_stateful(srv)
             for t in tools:
                 tools_map[t["name"]] = {"server": srv, "schema": t}
             print("[MCP] %d tools from %s" % (len(tools), srv_name))
@@ -220,45 +234,57 @@ def _fetch_mcp_tools():
 
 
 def _call_mcp_tool(tool_name, tool_args):
+    """
+    Call a tool using a fresh stateful session:
+      1. initialize -> session_id
+      2. notifications/initialized
+      3. tools/call
+    """
     tools_map = _fetch_mcp_tools()
     entry = tools_map.get(tool_name) if tools_map else None
     if not entry:
         return json.dumps({"error": "Tool not found: " + tool_name})
     srv = entry["server"]
+    url = srv["url"] + srv["path"]
+    srv_name = srv["name"]
+
+    # Step 1: initialize
     init_id = str(uuid.uuid4())
+    resp, session_id = _mcp_post(url, None, {
+        "jsonrpc": "2.0",
+        "id": init_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "cbr-pipe", "version": "4.8"},
+        },
+    })
+    if not resp or resp.get("id") != init_id:
+        return json.dumps({"error": "initialize failed for " + srv_name})
+
+    # Step 2: notifications/initialized
+    _mcp_post(url, session_id, {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    })
+
+    # Step 3: tools/call
     call_id = str(uuid.uuid4())
-    batch = [
-        {
-            "jsonrpc": "2.0",
-            "id": init_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "cbr-pipe", "version": "4.7"},
-            },
-        },
-        {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        },
-        {
-            "jsonrpc": "2.0",
-            "id": call_id,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": tool_args},
-        },
-    ]
-    responses = _mcp_batch(srv, batch)
-    for resp in responses:
-        if isinstance(resp, dict) and resp.get("id") == call_id:
-            result = resp.get("result", {})
-            content = result.get("content", [])
-            if isinstance(content, list):
-                texts = [c.get("text", "") for c in content
-                         if isinstance(c, dict) and c.get("type") == "text"]
-                return "\\n".join(texts) if texts else json.dumps(result)
-            return json.dumps(result)
+    resp2, _ = _mcp_post(url, session_id, {
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": tool_args},
+    })
+    if resp2 and resp2.get("id") == call_id:
+        result = resp2.get("result", {})
+        content = result.get("content", [])
+        if isinstance(content, list):
+            texts = [c.get("text", "") for c in content
+                     if isinstance(c, dict) and c.get("type") == "text"]
+            return "\\n".join(texts) if texts else json.dumps(result)
+        return json.dumps(result)
     return json.dumps({"error": "No response for tool: " + tool_name})
 
 
