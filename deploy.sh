@@ -53,6 +53,7 @@ COMPOSE_FILE="docker-compose.yml"
 OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.9.6"
 PATCHED_IMAGE="open-webui-patched:v0.9.6"
 INIT_IMAGE="open-webui-init:latest"
+GITLAB_MCP_IMAGE="gitlab-mcp:latest"
 FORCE_IMAGE=false
 HTTPS_PROXY_URL=""
 
@@ -129,7 +130,7 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Проверка базового образа open-webui ─────────────────────────────────────────────────────────
+# ── Проверка базового образа open-webui ───────────────────────────────────────────────
 log "Проверка базового образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
@@ -137,7 +138,7 @@ if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
 fi
 ok "Базовый образ найден локально"
 
-# ── Сборка патченого образа open-webui-patched локально ─────────────────────────────
+# ── Сборка патченого образа open-webui-patched локально ───────────────────────
 log "Сборка патченого образа ${PATCHED_IMAGE} из Dockerfile..."
 docker build -t "${PATCHED_IMAGE}" "${SCRIPT_DIR}" \
   || error "Не удалось собрать ${PATCHED_IMAGE}"
@@ -162,7 +163,7 @@ if [[ "${NEED_PATCHED_TRANSFER}" == "true" ]]; then
   ok "Образ ${PATCHED_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
-# ── Сборка и передача open-webui-init образа ────────────────────────────────────────────────────────
+# ── Сборка и передача open-webui-init образа ────────────────────────────────────────────
 log "Сборка образа ${INIT_IMAGE} локально из scripts/Dockerfile..."
 docker build --no-cache -t "${INIT_IMAGE}" "${SCRIPT_DIR}/scripts" \
   || error "Не удалось собрать образ ${INIT_IMAGE}"
@@ -187,7 +188,32 @@ if [[ "${NEED_INIT_TRANSFER}" == "true" ]]; then
   ok "Образ ${INIT_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────────────────────────────────
+# ── Сборка gitlab-mcp образа с зафиксированным zod@3 ──────────────────────────────────
+log "Сборка образа ${GITLAB_MCP_IMAGE} локально из gitlab-mcp/Dockerfile..."
+docker build -t "${GITLAB_MCP_IMAGE}" "${SCRIPT_DIR}/gitlab-mcp" \
+  || error "Не удалось собрать образ ${GITLAB_MCP_IMAGE}"
+LOCAL_GITLAB_MCP_ID=$(docker image inspect "${GITLAB_MCP_IMAGE}" --format '{{.Id}}')
+ok "Образ ${GITLAB_MCP_IMAGE} собран (ID: ${LOCAL_GITLAB_MCP_ID:7:12})"
+
+NEED_GITLAB_MCP_TRANSFER=true
+if [[ "${FORCE_IMAGE}" == "false" ]]; then
+  log "Проверка ${GITLAB_MCP_IMAGE} на ${REMOTE_HOST}..."
+  REMOTE_GITLAB_MCP_ID=$($SSH_CMD "docker image inspect ${GITLAB_MCP_IMAGE} --format '{{.Id}}' 2>/dev/null || echo 'MISSING'")
+  if [[ "${REMOTE_GITLAB_MCP_ID}" == "${LOCAL_GITLAB_MCP_ID}" ]]; then
+    ok "Образ ${GITLAB_MCP_IMAGE} на сервере актуален — передача пропущена"
+    NEED_GITLAB_MCP_TRANSFER=false
+  else
+    log "Образ ${GITLAB_MCP_IMAGE} на сервере отсутствует или устарел — будет передан"
+  fi
+fi
+
+if [[ "${NEED_GITLAB_MCP_TRANSFER}" == "true" ]]; then
+  log "Передача образа ${GITLAB_MCP_IMAGE} на ${REMOTE_HOST}..."
+  docker save "${GITLAB_MCP_IMAGE}" | $SSH_CMD 'docker load'
+  ok "Образ ${GITLAB_MCP_IMAGE} загружен на ${REMOTE_HOST}"
+fi
+
+# ── Конфигурация ────────────────────────────────────────────────────────────────────────────────────────────────────
 log "Подготовка конфигурации (ветка: ${GIT_BRANCH})..."
 LOCAL_ARCHIVE="$(mktemp /tmp/open-webui-deploy-XXXXXX.tar.gz)"
 git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHIVE}" \
@@ -259,7 +285,7 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# ── Полная остановка и гарантированное удаление всех данных ──────────────────────────
+# ── Полная остановка и гарантированное удаление всех данных ──────────────────────
 log "Остановка стека и удаление данных (чистый деплой)..."
 
 # 1. docker compose down --volumes (удаляет volumes, описанные в compose-файле)
@@ -269,10 +295,6 @@ eval "\${DC_CMD} down --remove-orphans --volumes" 2>/dev/null || true
 docker rm -f open-webui open-webui-init 2>/dev/null || true
 
 # 3. Гарантированное удаление webui-data во всех возможных именах:
-# docker compose может назвать volume по-разному в зависимости от имени проекта:
-#   open-webui-deploy_webui-data  (docker compose v2, дефолт)
-#   openwebuideploy_webui-data    (дефис убран)
-#   webui-data                    (редко, но возможно)
 FOUND_VOLUMES=\$(docker volume ls --format '{{.Name}}' | grep -E '(^|_)webui-data\$' || true)
 if [[ -n "\${FOUND_VOLUMES}" ]]; then
   for VOL in \${FOUND_VOLUMES}; do
@@ -288,7 +310,7 @@ log "Запуск open-webui..."
 eval "\${DC_CMD} up -d --no-build open-webui"
 ok "open-webui запущен"
 
-# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────────────
+# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────────
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
 HEALTHY=false
@@ -329,7 +351,7 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Проверка доступности MCP-серверов через TCP ──────────────────────────────────────
+# ── Проверка доступности MCP-серверов через TCP ──────────────────────────────────
 MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
 log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
@@ -361,7 +383,7 @@ done
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера ────────────────────────────────────────────────────────────────────────────────────
+# ── Запуск init-контейнера ────────────────────────────────────────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
 # Удаляем контейнер если остался от предыдущего запуска
 docker rm -f open-webui-init 2>/dev/null || true
@@ -371,7 +393,7 @@ eval "\${DC_CMD} run --name open-webui-init open-webui-init" || INIT_EXIT=\$?
 echo ""
 echo "═════ ЛОГИ init-контейнера ═════"
 docker logs open-webui-init 2>&1 || true
-echo "═══════════════════════════════"
+echo "════════════════════════════════"
 
 if [[ "\${INIT_EXIT}" == "0" ]]; then
   ok "Init-контейнер завершился успешно"
