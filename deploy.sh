@@ -26,6 +26,7 @@
 # Скрипт сравнивает Image ID локально и на сервере — если совпадают,
 # передача пропускается. Иначе передаёт образ через docker save | ssh docker load.
 # .env всегда берётся из git (редактируйте его локально и деплойте).
+# Контейнер пересоздаётся автоматически если изменился .env или docker-compose.yml.
 # Данные Open WebUI (чаты, пользователи, настройки) полностью сбрасываются
 # при каждом деплое (удаление volume webui-data).
 # =============================================================================
@@ -129,7 +130,31 @@ ok "Зависимости в порядке"
 DOCKER_COMPOSE=$($SSH_CMD 'if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi')
 log "Используем: ${DOCKER_COMPOSE}"
 
-# ── Проверка базового образа open-webui ─────────────────────────────────────────────────────────
+# ── Вычисляем хэш конфигурации (.env + docker-compose.yml) локально ────────────────────
+log "Вычисление хэша конфигурации (.env + docker-compose.yml)..."
+LOCAL_CONFIG_HASH=$(
+  git -C "${SCRIPT_DIR}" show "${GIT_BRANCH}:.env" 2>/dev/null
+  git -C "${SCRIPT_DIR}" show "${GIT_BRANCH}:docker-compose.yml" 2>/dev/null
+) 
+LOCAL_CONFIG_HASH=$(echo "${LOCAL_CONFIG_HASH}" | sha256sum | cut -d' ' -f1)
+ok "Локальный хэш: ${LOCAL_CONFIG_HASH:0:12}..."
+
+# Получаем хэш с сервера
+REMOTE_CONFIG_HASH=$($SSH_CMD "cat ~/open-webui-deploy/.config-hash 2>/dev/null || echo 'MISSING'")
+
+NEED_RECREATE=false
+if [[ "${REMOTE_CONFIG_HASH}" == "${LOCAL_CONFIG_HASH}" ]]; then
+  ok "Конфигурация не изменилась — пересоздание контейнера не нужно"
+else
+  if [[ "${REMOTE_CONFIG_HASH}" == "MISSING" ]]; then
+    warn "Хэш конфигурации на сервере не найден — первый деплой или обновление"
+  else
+    warn "Конфигурация изменилась (.env или docker-compose.yml) — контейнер будет пересоздан"
+  fi
+  NEED_RECREATE=true
+fi
+
+# ── Проверка базового образа open-webui ───────────────────────────────────────────────
 log "Проверка базового образа ${OPEN_WEBUI_IMAGE} локально..."
 if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
   warn "Образ ${OPEN_WEBUI_IMAGE} не найден локально — запускаем docker pull..."
@@ -137,7 +162,7 @@ if ! docker image inspect "${OPEN_WEBUI_IMAGE}" >/dev/null 2>&1; then
 fi
 ok "Базовый образ найден локально"
 
-# ── Сборка патченого образа open-webui-patched локально ─────────────────────────────
+# ── Сборка патченого образа open-webui-patched локально ──────────────────────────
 log "Сборка патченого образа ${PATCHED_IMAGE} из Dockerfile..."
 docker build -t "${PATCHED_IMAGE}" "${SCRIPT_DIR}" \
   || error "Не удалось собрать ${PATCHED_IMAGE}"
@@ -153,6 +178,7 @@ if [[ "${FORCE_IMAGE}" == "false" ]]; then
     NEED_PATCHED_TRANSFER=false
   else
     log "Образ ${PATCHED_IMAGE} на сервере отсутствует или устарел — будет передан"
+    NEED_RECREATE=true
   fi
 fi
 
@@ -162,7 +188,7 @@ if [[ "${NEED_PATCHED_TRANSFER}" == "true" ]]; then
   ok "Образ ${PATCHED_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
-# ── Сборка и передача open-webui-init образа ────────────────────────────────────────────────────────
+# ── Сборка и передача open-webui-init образа ─────────────────────────────────────────────
 log "Сборка образа ${INIT_IMAGE} локально из scripts/Dockerfile..."
 docker build --no-cache -t "${INIT_IMAGE}" "${SCRIPT_DIR}/scripts" \
   || error "Не удалось собрать образ ${INIT_IMAGE}"
@@ -187,7 +213,7 @@ if [[ "${NEED_INIT_TRANSFER}" == "true" ]]; then
   ok "Образ ${INIT_IMAGE} загружен на ${REMOTE_HOST}"
 fi
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────────────────────────────────
+# ── Конфигурация ──────────────────────────────────────────────────────────────────────────────────────
 log "Подготовка конфигурации (ветка: ${GIT_BRANCH})..."
 LOCAL_ARCHIVE="$(mktemp /tmp/open-webui-deploy-XXXXXX.tar.gz)"
 git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHIVE}" \
@@ -209,6 +235,8 @@ APP_DIR="${APP_DIR}"
 DOCKER_COMPOSE="${DOCKER_COMPOSE}"
 APP_PORT="${APP_PORT}"
 COMPOSE_FILE="${COMPOSE_FILE}"
+NEED_RECREATE="${NEED_RECREATE}"
+LOCAL_CONFIG_HASH="${LOCAL_CONFIG_HASH}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
@@ -259,20 +287,12 @@ if [[ "\${PORT_IN_USE}" == "true" ]]; then
   fi
 fi
 
-# ── Полная остановка и гарантированное удаление всех данных ──────────────────────────
+# ── Полная остановка и гарантированное удаление всех данных ────────────────────
 log "Остановка стека и удаление данных (чистый деплой)..."
 
-# 1. docker compose down --volumes (удаляет volumes, описанные в compose-файле)
 eval "\${DC_CMD} down --remove-orphans --volumes" 2>/dev/null || true
-
-# 2. Удаляем контейнеры вручную (docker-compose v1 не удаляет run-контейнеры через down)
 docker rm -f open-webui open-webui-init 2>/dev/null || true
 
-# 3. Гарантированное удаление webui-data во всех возможных именах:
-# docker compose может назвать volume по-разному в зависимости от имени проекта:
-#   open-webui-deploy_webui-data  (docker compose v2, дефолт)
-#   openwebuideploy_webui-data    (дефис убран)
-#   webui-data                    (редко, но возможно)
 FOUND_VOLUMES=\$(docker volume ls --format '{{.Name}}' | grep -E '(^|_)webui-data\$' || true)
 if [[ -n "\${FOUND_VOLUMES}" ]]; then
   for VOL in \${FOUND_VOLUMES}; do
@@ -283,12 +303,21 @@ else
 fi
 ok "Старые данные очищены"
 
-# Запускаем ТОЛЬКО open-webui (образ уже передан локально — сборка не нужна)
-log "Запуск open-webui..."
-eval "\${DC_CMD} up -d --no-build open-webui"
+# ── Запуск open-webui с --force-recreate если конфигурация изменилась ────────────────
+if [[ "\${NEED_RECREATE}" == "true" ]]; then
+  log "Пересоздание контейнера (конфигурация изменилась)..."
+  eval "\${DC_CMD} up -d --no-build --force-recreate open-webui"
+else
+  log "Запуск open-webui (конфигурация не изменилась)..."
+  eval "\${DC_CMD} up -d --no-build open-webui"
+fi
 ok "open-webui запущен"
 
-# ── Ждём готовности Open WebUI по /health ──────────────────────────────────────────────
+# ── Сохраняем хэш конфигурации на сервере ──────────────────────────────────────────
+echo "\${LOCAL_CONFIG_HASH}" > "\${APP_DIR}/.config-hash"
+ok "Хэш конфигурации сохранён: \${LOCAL_CONFIG_HASH:0:12}..."
+
+# ── Ждём готовности Open WebUI по /health ────────────────────────────────────────────
 log "Ожидание готовности Open WebUI (max 300 сек)..."
 MAX_WAIT=300
 HEALTHY=false
@@ -329,7 +358,7 @@ if [[ "\$HEALTHY" != "true" ]]; then
 fi
 ok "Open WebUI готов за \${ELAPSED} сек"
 
-# ── Проверка доступности MCP-серверов через TCP ──────────────────────────────────────
+# ── Проверка доступности MCP-серверов через TCP ─────────────────────────────────────
 MCP_SERVERS=("localhost 8086" "localhost 8083")
 MCP_MAX_WAIT=60
 log "Проверка доступности MCP-серверов (TCP, max \${MCP_MAX_WAIT} сек)..."
@@ -361,9 +390,8 @@ done
 log "Пауза 5 сек для переподключения Open WebUI к MCP-серверам..."
 sleep 5
 
-# ── Запуск init-контейнера ────────────────────────────────────────────────────────────────────────────────────
+# ── Запуск init-контейнера ──────────────────────────────────────────────────────────────────────────
 log "Запуск init-контейнера (admin + pipe function + MCP)..."
-# Удаляем контейнер если остался от предыдущего запуска
 docker rm -f open-webui-init 2>/dev/null || true
 INIT_EXIT=0
 eval "\${DC_CMD} run --name open-webui-init open-webui-init" || INIT_EXIT=\$?
@@ -371,7 +399,7 @@ eval "\${DC_CMD} run --name open-webui-init open-webui-init" || INIT_EXIT=\$?
 echo ""
 echo "═════ ЛОГИ init-контейнера ═════"
 docker logs open-webui-init 2>&1 || true
-echo "═══════════════════════════════"
+echo "════════════════════════════════"
 
 if [[ "\${INIT_EXIT}" == "0" ]]; then
   ok "Init-контейнер завершился успешно"
