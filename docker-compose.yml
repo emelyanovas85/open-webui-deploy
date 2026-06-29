@@ -16,7 +16,6 @@ services:
       - webui-data:/app/backend/data
     environment:
       # ── LLM Provider ─────────────────────────────────────────────────────
-      # Прямой OpenAI endpoint отключён — модели подключены через Pipe Function cbr_models.
       - OPENAI_API_KEY=
       - OPENAI_API_BASE_URL=
 
@@ -39,7 +38,7 @@ services:
       - DEFAULT_USER_ROLE=${DEFAULT_USER_ROLE:-pending}
       - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
 
-      # ── Task models (заголовки, теги) ─────────────────────────────
+      # ── Task models ─────────────────────────────────────────
       - TASK_MODEL=${TASK_MODEL:-}
       - TASK_MODEL_EXTERNAL=${TASK_MODEL_EXTERNAL:-Qwen/Qwen3.5-397B-A17B-GPTQ-Int4}
 
@@ -48,7 +47,7 @@ services:
       - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-text-embedding-3-small}
       - ENABLE_RAG_WEB_SEARCH=${ENABLE_RAG_WEB_SEARCH:-false}
 
-      # ── SSL: sitecustomize.py патчит ssl.create_default_context через PYTHONPATH ────
+      # ── SSL ────────────────────────────────────────────────
       - PYTHONPATH=/app/scripts
       - OPENSSL_CONF=/etc/ssl/openssl.cnf
       - REQUESTS_CA_BUNDLE=
@@ -56,15 +55,14 @@ services:
       - PYTHONHTTPSVERIFY=0
 
       # ── Прокси ─────────────────────────────────────────────────
-      # ВАЖНО: значения берутся из .env без дефолтов с CIDR —
-      # Python (aiohttp) не поддерживает CIDR в NO_PROXY.
-      # Список конкретных IP задаётся в .env.
+      # NO_PROXY прописан явно (не через ${VAR}) — обход бага docker-compose v1,
+      # который обрезает значения переменных по первой запятой при подстановке из .env.
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - http_proxy=
       - https_proxy=
-      - NO_PROXY=${NO_PROXY}
-      - no_proxy=${no_proxy}
+      - NO_PROXY=localhost,127.0.0.1,10.1.5.97,10.1.5.6,10.1.26.2,chat.ehd-zr.cbr.ru
+      - no_proxy=localhost,127.0.0.1,10.1.5.97,10.1.5.6,10.1.26.2,chat.ehd-zr.cbr.ru
 
       # ── MCP ───────────────────────────────────────────────────
       - MCP_INITIALIZE_TIMEOUT=${MCP_INITIALIZE_TIMEOUT:-30}
