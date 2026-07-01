@@ -11,9 +11,13 @@ MCP protocol (Streamable HTTP, stateful mode):
 NOTE: supergateway MUST be started with --stateful flag.
       Without it every POST is a new process and session is lost between requests.
 
-MCP_SERVER_URLS format: url1::name1,url2::name2
+MCP_SERVER_URLS format: url1::name1::desc1,url2::name2::desc2
 Example:
-  MCP_SERVER_URLS=http://10.1.5.97:8086/mcp::Java MCP,http://10.1.5.97:8083::GitLab MCP
+  MCP_SERVER_URLS=http://10.1.5.97:8086/mcp::Java MCP,http://10.1.5.97:8083/mcp::GitLab MCP
+
+MCP_BEARER_TOKENS format: url::token,url2::token2
+Example:
+  MCP_BEARER_TOKENS=http://10.1.5.97:8083/mcp::glpat-xxxx
 
 MCP Tool Servers are registered in Open WebUI UI via POST /api/v1/configs/tool_servers
 so that tools are visible in the chat interface (+/Tools button).
@@ -35,11 +39,30 @@ ADMIN_PASSWORD = os.environ.get("WEBUI_ADMIN_PASSWORD", "")
 
 MCP_SERVER_URLS_RAW = os.environ.get("MCP_SERVER_URLS", "")
 MCP_SERVER_URL_LEGACY = os.environ.get("MCP_SERVER_URL", "")
+MCP_BEARER_TOKENS_RAW = os.environ.get("MCP_BEARER_TOKENS", "")
 
 DB_PATH = "/app/backend/data/webui.db"
 
 PIPE_FUNCTION_ID = "cbr_models"
 PIPE_FUNCTION_NAME = "CBR Models"
+
+
+def parse_bearer_tokens():
+    """Parse MCP_BEARER_TOKENS=url::token,url2::token2 into a dict {url: token}."""
+    result = {}
+    if not MCP_BEARER_TOKENS_RAW:
+        return result
+    for entry in MCP_BEARER_TOKENS_RAW.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("::", 1)
+        if len(parts) == 2:
+            url = parts[0].strip()
+            token = parts[1].strip()
+            if url and token:
+                result[url] = token
+    return result
 
 
 def detect_transport(url: str) -> dict:
@@ -65,6 +88,7 @@ def parse_mcp_servers():
             servers.append({
                 "url": transport["base_url"],
                 "path": transport["path"],
+                "raw_url": raw_url,
                 "name": name,
                 "description": desc,
             })
@@ -73,6 +97,7 @@ def parse_mcp_servers():
         servers.append({
             "url": transport["base_url"],
             "path": transport["path"],
+            "raw_url": MCP_SERVER_URL_LEGACY,
             "name": "mcp_server",
             "description": "MCP Tool Server",
         })
@@ -91,7 +116,7 @@ def parse_mcp_server_urls(env_value):
         parsed = urlparse(raw_url)
         base_url = "%s://%s" % (parsed.scheme, parsed.netloc)
         path = parsed.path.rstrip("/") or "/mcp"
-        servers.append({"url": base_url, "path": path, "name": name})
+        servers.append({"url": base_url, "path": path, "name": name, "raw_url": raw_url})
     return servers
 
 
@@ -103,8 +128,8 @@ if _MCP_ENV:
         print("         * %s  %s%s" % (s["name"], s["url"], s["path"]))
 else:
     _MCP_SERVERS_PARSED = [
-        {"url": "http://10.1.5.97:8086", "path": "/mcp", "name": "Java MCP"},
-        {"url": "http://10.1.5.97:8083", "path": "/mcp", "name": "GitLab MCP"},
+        {"url": "http://10.1.5.97:8086", "path": "/mcp", "raw_url": "http://10.1.5.97:8086/mcp", "name": "Java MCP"},
+        {"url": "http://10.1.5.97:8083", "path": "/mcp", "raw_url": "http://10.1.5.97:8083/mcp", "name": "GitLab MCP"},
     ]
     print("[CONFIG] MCP_SERVER_URLS not set -- using defaults")
 
@@ -196,11 +221,12 @@ def _parse_sse(text):
     return None
 
 
-def _mcp_post(url, session_id, payload):
+def _mcp_post(url, session_id, payload, bearer_token=None):
     """
     Single POST to MCP endpoint.
     Returns (response_dict_or_None, session_id_str).
     session_id from initialize response header is returned for subsequent calls.
+    bearer_token: if set, adds Authorization: Bearer header (REMOTE_AUTHORIZATION=true).
     """
     headers = {
         "Content-Type": "application/json",
@@ -208,6 +234,8 @@ def _mcp_post(url, session_id, payload):
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
+    if bearer_token:
+        headers["Authorization"] = "Bearer " + bearer_token
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0, read=20.0)) as client:
             resp = client.post(url, content=json.dumps(payload), headers=headers)
@@ -234,6 +262,7 @@ def _mcp_post(url, session_id, payload):
 def _mcp_fetch_tools_stateful(server):
     url = server["url"] + server["path"]
     srv_name = server["name"]
+    bearer_token = server.get("bearer_token")
 
     init_id = str(uuid.uuid4())
     resp, session_id = _mcp_post(url, None, {
@@ -245,7 +274,7 @@ def _mcp_fetch_tools_stateful(server):
             "capabilities": {},
             "clientInfo": {"name": "cbr-pipe", "version": "4.9"},
         },
-    })
+    }, bearer_token=bearer_token)
     if not resp or resp.get("id") != init_id:
         print("[MCP] initialize failed for %s" % srv_name)
         return []
@@ -253,7 +282,7 @@ def _mcp_fetch_tools_stateful(server):
     _mcp_post(url, session_id, {
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
-    })
+    }, bearer_token=bearer_token)
 
     list_id = str(uuid.uuid4())
     resp2, _ = _mcp_post(url, session_id, {
@@ -261,7 +290,7 @@ def _mcp_fetch_tools_stateful(server):
         "id": list_id,
         "method": "tools/list",
         "params": {},
-    })
+    }, bearer_token=bearer_token)
     if resp2 and resp2.get("id") == list_id:
         return resp2.get("result", {}).get("tools", [])
     return []
@@ -293,6 +322,7 @@ def _call_mcp_tool(tool_name, tool_args):
     srv = entry["server"]
     url = srv["url"] + srv["path"]
     srv_name = srv["name"]
+    bearer_token = srv.get("bearer_token")
 
     init_id = str(uuid.uuid4())
     resp, session_id = _mcp_post(url, None, {
@@ -304,14 +334,14 @@ def _call_mcp_tool(tool_name, tool_args):
             "capabilities": {},
             "clientInfo": {"name": "cbr-pipe", "version": "4.9"},
         },
-    })
+    }, bearer_token=bearer_token)
     if not resp or resp.get("id") != init_id:
         return _safe_json({"error": "initialize failed for " + srv_name})
 
     _mcp_post(url, session_id, {
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
-    })
+    }, bearer_token=bearer_token)
 
     call_id = str(uuid.uuid4())
     resp2, _ = _mcp_post(url, session_id, {
@@ -319,7 +349,7 @@ def _call_mcp_tool(tool_name, tool_args):
         "id": call_id,
         "method": "tools/call",
         "params": {"name": tool_name, "arguments": tool_args},
-    })
+    }, bearer_token=bearer_token)
     if resp2 and resp2.get("id") == call_id:
         result = resp2.get("result", {})
         content = result.get("content", [])
@@ -600,28 +630,55 @@ def make_stub_info(url, name="mcp"):
 
 
 def sync_mcp_tool_servers(token):
-    """Register MCP servers in Open WebUI UI via /api/v1/configs/tool_servers."""
+    """Register MCP servers in Open WebUI UI via /api/v1/configs/tool_servers.
+
+    For servers with REMOTE_AUTHORIZATION=true (e.g. GitLab MCP), sets
+    auth_type=bearer and key=<token> so Open WebUI includes
+    Authorization: Bearer <token> in every MCP request automatically.
+
+    Bearer tokens are read from MCP_BEARER_TOKENS env var:
+      MCP_BEARER_TOKENS=http://10.1.5.97:8083/mcp::glpat-xxxx
+    """
     servers = parse_mcp_servers()
     if not servers:
         print("[SKIP] No MCP servers configured (MCP_SERVER_URLS not set)")
         return
 
+    bearer_tokens = parse_bearer_tokens()
+    if bearer_tokens:
+        print("[CONFIG] Bearer tokens configured for %d server(s)" % len(bearer_tokens))
+        for url in bearer_tokens:
+            print("         * %s (token: %s...)" % (url, bearer_tokens[url][:8]))
+
     headers = {"Authorization": "Bearer %s" % token, "Content-Type": "application/json"}
 
     new_connections = []
     for srv in servers:
+        raw_url = srv.get("raw_url", srv["url"] + srv["path"])
+        bearer_token = bearer_tokens.get(raw_url, "")
+
+        if bearer_token:
+            auth_type = "bearer"
+            key = bearer_token
+            print("[INFO] MCP server: %s -> %s (path: %s, auth: bearer)" % (
+                srv["name"], srv["url"], srv["path"]))
+        else:
+            auth_type = "none"
+            key = ""
+            print("[INFO] MCP server: %s -> %s (path: %s, auth: none)" % (
+                srv["name"], srv["url"], srv["path"]))
+
         conn = {
             "url": srv["url"],
             "path": srv["path"],
             "type": "mcp",
-            "auth_type": "none",
-            "key": "",
+            "auth_type": auth_type,
+            "key": key,
             "headers": None,
             "config": {"enable": True},
             "info": make_stub_info(srv["url"], srv["name"]),
         }
         new_connections.append(conn)
-        print("[INFO] MCP server: %s -> %s (path: %s)" % (srv["name"], srv["url"], srv["path"]))
 
     r = requests.post(
         "%s/api/v1/configs/tool_servers" % BASE_URL,
