@@ -247,6 +247,11 @@ ok "Архив создан ($(du -sh "${LOCAL_ARCHIVE}" | cut -f1))"
 
 # ── Подставляем GITLAB_MCP_TOKEN в .env внутри архива ────────────────────────
 # Токен не хранится в git — подставляется только в момент деплоя.
+# Патчим ТРИ строки:
+#   1. GITLAB_MCP_TOKEN=<плейсхолдер>  → GITLAB_MCP_TOKEN=<реальный токен>
+#   2. MCP_BEARER_TOKENS=...::<плейсхолдер>  → MCP_BEARER_TOKENS=...::<<реальный токен>
+#      (docker-compose v1 не умеет интерполировать ${VAR} внутри значений,
+#       поэтому токен вписываем в .env напрямую)
 if [[ -n "${GITLAB_MCP_TOKEN}" ]]; then
   log "Подстановка GITLAB_MCP_TOKEN в .env архива..."
   PATCH_TMPDIR="$(mktemp -d /tmp/deploy-patch-XXXXXX)"
@@ -254,15 +259,27 @@ if [[ -n "${GITLAB_MCP_TOKEN}" ]]; then
 
   ENV_FILE="${PATCH_TMPDIR}/.env"
   if [[ -f "${ENV_FILE}" ]]; then
-    # Заменяем плейсхолдер токена
+    # 1. Строка GITLAB_MCP_TOKEN=
     sed -i "s|^GITLAB_MCP_TOKEN=.*|GITLAB_MCP_TOKEN=${GITLAB_MCP_TOKEN}|" "${ENV_FILE}"
-    # Раскрываем переменную в MCP_BEARER_TOKENS (на случай если там ${GITLAB_MCP_TOKEN})
+
+    # 2. Буквальный плейсхолдер glpat-your-token-here в MCP_BEARER_TOKENS
+    sed -i "s|glpat-your-token-here|${GITLAB_MCP_TOKEN}|g" "${ENV_FILE}"
+
+    # 3. Переменная \${GITLAB_MCP_TOKEN} в MCP_BEARER_TOKENS (на случай если кто-то
+    #    использует такой формат в .env вместо плейсхолдера)
     sed -i "s|\${GITLAB_MCP_TOKEN}|${GITLAB_MCP_TOKEN}|g" "${ENV_FILE}"
 
     # Пересобираем архив с патченым .env
     rm -f "${LOCAL_ARCHIVE}"
     tar -czf "${LOCAL_ARCHIVE}" -C "${PATCH_TMPDIR}" .
     ok "GITLAB_MCP_TOKEN подставлен в .env (токен: ${GITLAB_MCP_TOKEN:0:10}...)"
+
+    # Верификация — убеждаемся что плейсхолдер не остался
+    if grep -q 'glpat-your-token-here' "${ENV_FILE}" 2>/dev/null; then
+      warn "ВНИМАНИЕ: в .env остался плейсхолдер glpat-your-token-here — проверьте вручную!"
+    else
+      ok "Верификация: плейсхолдер glpat-your-token-here в .env не обнаружен"
+    fi
   else
     warn ".env не найден в архиве — токен не подставлен"
   fi
