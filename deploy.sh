@@ -61,7 +61,7 @@ PATCHED_IMAGE="open-webui-patched:v0.9.6"
 INIT_IMAGE="open-webui-init:latest"
 FORCE_IMAGE=false
 HTTPS_PROXY_URL=""
-GITLAB_MCP_TOKEN=""
+GITLAB_MCP_TOKEN="ehkqnxMf8bpRL1jMctRj"
 
 usage() {
   grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
