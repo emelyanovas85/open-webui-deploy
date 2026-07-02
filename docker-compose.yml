@@ -81,11 +81,14 @@ services:
       - open-webui
     volumes:
       - webui-data:/app/backend/data
+    # ВАЖНО: используем env_file вместо environment: ${VAR} для переменных
+    # содержащих запятые и :: (MCP_SERVER_URLS, MCP_BEARER_TOKENS).
+    # Docker Compose v1 обрезает значения по первой запятой при ${VAR}-подстановке.
+    # env_file читает .env дословно — все значения передаются целиком.
+    env_file:
+      - .env
     environment:
-      - WEBUI_BASE_URL=${WEBUI_BASE_URL:-http://open-webui:8080}
-      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL:-}
-      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD:-}
-      - MCP_SERVER_URLS=${MCP_SERVER_URLS:-}
+      # NO_PROXY переопределяем явно — добавляем open-webui (имя сервиса в сети)
       - NO_PROXY=localhost,127.0.0.1,10.1.5.97,10.1.5.6,open-webui
       - no_proxy=localhost,127.0.0.1,10.1.5.97,10.1.5.6,open-webui
     networks:

@@ -6,17 +6,21 @@
 #   ./deploy.sh [ОПЦИИ]
 #
 # Опции:
-#   -h, --host      SSH-хост удалённой машины (по умолчанию: 10.1.5.97)
-#   -u, --user      SSH-пользователь (по умолчанию: svc-local-adm)
-#   -p, --port      SSH-порт (по умолчанию: 22)
-#   -i, --identity  Путь к приватному SSH-ключу (необязательно)
-#   -b, --branch    Ветка Git для деплоя (по умолчанию: main)
-#   --force-image   Принудительно передать образ, даже если он уже актуален
-#   --proxy         HTTP/HTTPS прокси для docker pull (напр.: http://proxy:3128)
-#   --help          Показать справку
+#   -h, --host           SSH-хост удалённой машины (по умолчанию: 10.1.5.97)
+#   -u, --user           SSH-пользователь (по умолчанию: svc-local-adm)
+#   -p, --port           SSH-порт (по умолчанию: 22)
+#   -i, --identity       Путь к приватному SSH-ключу (необязательно)
+#   -b, --branch         Ветка Git для деплоя (по умолчанию: main)
+#       --gitlab-token   GitLab Personal Access Token для GitLab MCP
+#                        (REMOTE_AUTHORIZATION=true). Если не указан —
+#                        будет запрошен интерактивно (ввод скрыт).
+#   --force-image        Принудительно передать образ, даже если он уже актуален
+#   --proxy              HTTP/HTTPS прокси для docker pull (напр.: http://proxy:3128)
+#   --help               Показать справку
 #
 # Примеры:
 #   ./deploy.sh
+#   ./deploy.sh --gitlab-token glpat-xxxxxxxxxxxxxxxxxxxx
 #   ./deploy.sh -h 192.168.1.100 -u deploy
 #   ./deploy.sh -i ~/.ssh/id_rsa -b feature/new-config
 #   ./deploy.sh --force-image
@@ -26,6 +30,7 @@
 # Скрипт сравнивает Image ID локально и на сервере — если совпадают,
 # передача пропускается. Иначе передаёт образ через docker save | ssh docker load.
 # .env всегда берётся из git (редактируйте его локально и деплойте).
+# GITLAB_MCP_TOKEN подставляется в .env прямо перед деплоем — в git не хранится.
 # Контейнер пересоздаётся автоматически если изменился .env или docker-compose.yml.
 # Данные Open WebUI (чаты, пользователи, настройки) полностью сбрасываются
 # при каждом деплое (удаление volume webui-data).
@@ -56,6 +61,7 @@ PATCHED_IMAGE="open-webui-patched:v0.9.6"
 INIT_IMAGE="open-webui-init:latest"
 FORCE_IMAGE=false
 HTTPS_PROXY_URL=""
+GITLAB_MCP_TOKEN=""
 
 usage() {
   grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
@@ -64,20 +70,39 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--host)      REMOTE_HOST="$2";       shift 2 ;;
-    -u|--user)      REMOTE_USER="$2";       shift 2 ;;
-    -p|--port)      REMOTE_PORT="$2";       shift 2 ;;
-    -i|--identity)  SSH_KEY="$2";           shift 2 ;;
-    -b|--branch)    GIT_BRANCH="$2";        shift 2 ;;
-    --force-image)  FORCE_IMAGE=true;       shift   ;;
-    --proxy)        HTTPS_PROXY_URL="$2";   shift 2 ;;
-    --help)         usage ;;
+    -h|--host)           REMOTE_HOST="$2";       shift 2 ;;
+    -u|--user)           REMOTE_USER="$2";       shift 2 ;;
+    -p|--port)           REMOTE_PORT="$2";       shift 2 ;;
+    -i|--identity)       SSH_KEY="$2";           shift 2 ;;
+    -b|--branch)         GIT_BRANCH="$2";        shift 2 ;;
+        --gitlab-token)  GITLAB_MCP_TOKEN="$2";  shift 2 ;;
+    --force-image)       FORCE_IMAGE=true;       shift   ;;
+    --proxy)             HTTPS_PROXY_URL="$2";   shift 2 ;;
+    --help)              usage ;;
     *) error "Неизвестный аргумент: $1. Используйте --help для справки." ;;
   esac
 done
 
 [[ -z "${HTTPS_PROXY_URL}" && -n "${HTTPS_PROXY:-}" ]] && HTTPS_PROXY_URL="${HTTPS_PROXY}"
 [[ -z "${HTTPS_PROXY_URL}" && -n "${https_proxy:-}" ]] && HTTPS_PROXY_URL="${https_proxy}"
+
+# ── GitLab MCP Token ───────────────────────────────────────────────────────────
+# Запрашиваем интерактивно, если не передан через --gitlab-token
+if [[ -z "${GITLAB_MCP_TOKEN}" ]]; then
+  echo -e "${YELLOW}GitLab MCP Token не указан.${NC}"
+  echo "  Токен нужен для GitLab MCP сервера (REMOTE_AUTHORIZATION=true)."
+  echo "  Получить: GitLab → User Settings → Access Tokens → Create (scope: api, read_api)"
+  echo ""
+  read -r -s -p "  Введите GitLab Personal Access Token (glpat-...): " GITLAB_MCP_TOKEN </dev/tty
+  echo ""
+  if [[ -z "${GITLAB_MCP_TOKEN}" ]]; then
+    warn "Токен не введён — GitLab MCP будет работать без авторизации (возможны ошибки 401)"
+  else
+    ok "Токен принят (${GITLAB_MCP_TOKEN:0:10}...)"
+  fi
+else
+  ok "GitLab MCP Token передан через --gitlab-token (${GITLAB_MCP_TOKEN:0:10}...)"
+fi
 
 docker_pull() {
   local image="$1"
@@ -220,6 +245,49 @@ git -C "${SCRIPT_DIR}" archive --format=tar.gz "${GIT_BRANCH}" -o "${LOCAL_ARCHI
   || error "Не удалось создать архив. Убедитесь, что ветка '${GIT_BRANCH}' существует локально."
 ok "Архив создан ($(du -sh "${LOCAL_ARCHIVE}" | cut -f1))"
 
+# ── Подставляем GITLAB_MCP_TOKEN в .env внутри архива ────────────────────────
+# Токен не хранится в git — подставляется только в момент деплоя.
+# Патчим ТРИ строки:
+#   1. GITLAB_MCP_TOKEN=<плейсхолдер>  → GITLAB_MCP_TOKEN=<реальный токен>
+#   2. MCP_BEARER_TOKENS=...::<плейсхолдер>  → MCP_BEARER_TOKENS=...::<<реальный токен>
+#      (docker-compose v1 не умеет интерполировать ${VAR} внутри значений,
+#       поэтому токен вписываем в .env напрямую)
+if [[ -n "${GITLAB_MCP_TOKEN}" ]]; then
+  log "Подстановка GITLAB_MCP_TOKEN в .env архива..."
+  PATCH_TMPDIR="$(mktemp -d /tmp/deploy-patch-XXXXXX)"
+  tar -xzf "${LOCAL_ARCHIVE}" -C "${PATCH_TMPDIR}"
+
+  ENV_FILE="${PATCH_TMPDIR}/.env"
+  if [[ -f "${ENV_FILE}" ]]; then
+    # 1. Строка GITLAB_MCP_TOKEN=
+    sed -i "s|^GITLAB_MCP_TOKEN=.*|GITLAB_MCP_TOKEN=${GITLAB_MCP_TOKEN}|" "${ENV_FILE}"
+
+    # 2. Буквальный плейсхолдер glpat-your-token-here в MCP_BEARER_TOKENS
+    sed -i "s|glpat-your-token-here|${GITLAB_MCP_TOKEN}|g" "${ENV_FILE}"
+
+    # 3. Переменная \${GITLAB_MCP_TOKEN} в MCP_BEARER_TOKENS (на случай если кто-то
+    #    использует такой формат в .env вместо плейсхолдера)
+    sed -i "s|\${GITLAB_MCP_TOKEN}|${GITLAB_MCP_TOKEN}|g" "${ENV_FILE}"
+
+    # Пересобираем архив с патченым .env
+    rm -f "${LOCAL_ARCHIVE}"
+    tar -czf "${LOCAL_ARCHIVE}" -C "${PATCH_TMPDIR}" .
+    ok "GITLAB_MCP_TOKEN подставлен в .env (токен: ${GITLAB_MCP_TOKEN:0:10}...)"
+
+    # Верификация — убеждаемся что плейсхолдер не остался
+    if grep -q 'glpat-your-token-here' "${ENV_FILE}" 2>/dev/null; then
+      warn "ВНИМАНИЕ: в .env остался плейсхолдер glpat-your-token-here — проверьте вручную!"
+    else
+      ok "Верификация: плейсхолдер glpat-your-token-here в .env не обнаружен"
+    fi
+  else
+    warn ".env не найден в архиве — токен не подставлен"
+  fi
+  rm -rf "${PATCH_TMPDIR}"
+else
+  warn "GITLAB_MCP_TOKEN пустой — .env не патчится, GitLab MCP может вернуть 401"
+fi
+
 log "Передача архива на ${REMOTE_HOST}..."
 $SSH_CMD "mkdir -p ${APP_DIR}"
 $SCP_CMD "${LOCAL_ARCHIVE}" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/app.tar.gz"
@@ -251,7 +319,7 @@ DC_CMD="\${DOCKER_COMPOSE} -f \${APP_DIR}/\${COMPOSE_FILE}"
 log "Распаковка архива..."
 tar -xzf "\${APP_DIR}/app.tar.gz" -C "\${APP_DIR}"
 rm -f "\${APP_DIR}/app.tar.gz"
-ok "Конфигурация распакована в \${APP_DIR} (.env взят из git)"
+ok "Конфигурация распакована в \${APP_DIR} (.env взят из git + токен подставлен)"
 
 chmod +x "\${APP_DIR}/scripts/"*.py 2>/dev/null || true
 
